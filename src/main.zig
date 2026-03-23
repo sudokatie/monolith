@@ -7,6 +7,7 @@ pub const errors = @import("core/errors.zig");
 // Storage components
 pub const page = @import("storage/page.zig");
 pub const file = @import("storage/file.zig");
+pub const meta = @import("storage/meta.zig");
 
 // Re-export commonly used types
 pub const PageId = types.PageId;
