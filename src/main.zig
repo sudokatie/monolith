@@ -4,6 +4,9 @@ const std = @import("std");
 pub const types = @import("core/types.zig");
 pub const errors = @import("core/errors.zig");
 
+// Storage components
+pub const page = @import("storage/page.zig");
+
 // Re-export commonly used types
 pub const PageId = types.PageId;
 pub const TransactionId = types.TransactionId;
