@@ -10,6 +10,7 @@ pub const file = @import("storage/file.zig");
 pub const meta = @import("storage/meta.zig");
 pub const freelist = @import("storage/freelist.zig");
 pub const buffer = @import("storage/buffer.zig");
+pub const btree_node = @import("storage/btree_node.zig");
 
 // Re-export commonly used types
 pub const PageId = types.PageId;
