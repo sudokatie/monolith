@@ -592,24 +592,26 @@ test "WALRecovery full cycle" {
     defer std.fs.cwd().deleteTree("/tmp/test_recovery_full") catch {};
 
     // Write some WAL records
-    var wal_writer = try writer.WALWriter.init(allocator, "/tmp/test_recovery_full", .none, writer.DEFAULT_SEGMENT_SIZE);
+    {
+        var wal_writer = try writer.WALWriter.init(allocator, "/tmp/test_recovery_full", .none, writer.DEFAULT_SEGMENT_SIZE);
+        defer wal_writer.deinit();
 
-    // Transaction 1: begin, insert, commit
-    _ = try wal_writer.writeBegin(1);
-    _ = try wal_writer.writeInsert(1, "key1", "value1");
-    _ = try wal_writer.writeCommit(1);
+        // Transaction 1: begin, insert, commit
+        _ = try wal_writer.writeBegin(1);
+        _ = try wal_writer.writeInsert(1, "key1", "value1");
+        _ = try wal_writer.writeCommit(1);
 
-    // Transaction 2: begin, insert (no commit - will be undone)
-    _ = try wal_writer.writeBegin(2);
-    _ = try wal_writer.writeInsert(2, "key2", "value2");
+        // Transaction 2: begin, insert (no commit - will be undone)
+        _ = try wal_writer.writeBegin(2);
+        _ = try wal_writer.writeInsert(2, "key2", "value2");
 
-    // Transaction 3: begin, insert, abort
-    _ = try wal_writer.writeBegin(3);
-    _ = try wal_writer.writeInsert(3, "key3", "value3");
-    _ = try wal_writer.writeAbort(3);
+        // Transaction 3: begin, insert, abort
+        _ = try wal_writer.writeBegin(3);
+        _ = try wal_writer.writeInsert(3, "key3", "value3");
+        _ = try wal_writer.writeAbort(3);
 
-    try wal_writer.flush();
-    wal_writer.deinit();
+        try wal_writer.flush();
+    }
 
     // Now recover
     var recovery = try WALRecovery.init(allocator, "/tmp/test_recovery_full");
@@ -632,12 +634,12 @@ test "WALReader iterate records" {
 
     // Write some records
     var wal_writer = try writer.WALWriter.init(allocator, "/tmp/test_reader", .none, writer.DEFAULT_SEGMENT_SIZE);
+    defer wal_writer.deinit();
     _ = try wal_writer.writeBegin(1);
     _ = try wal_writer.writeInsert(1, "k1", "v1");
     _ = try wal_writer.writeInsert(1, "k2", "v2");
     _ = try wal_writer.writeCommit(1);
     try wal_writer.flush();
-    wal_writer.deinit();
 
     // Read them back
     var reader = try WALReader.init(allocator, "/tmp/test_reader", 1);
@@ -661,12 +663,12 @@ test "WALReader with start LSN" {
 
     // Write records with LSNs 1, 2, 3, 4
     var wal_writer = try writer.WALWriter.init(allocator, "/tmp/test_reader_lsn", .none, writer.DEFAULT_SEGMENT_SIZE);
+    defer wal_writer.deinit();
     _ = try wal_writer.writeBegin(1);
     _ = try wal_writer.writeInsert(1, "k1", "v1");
     _ = try wal_writer.writeInsert(1, "k2", "v2");
     _ = try wal_writer.writeCommit(1);
     try wal_writer.flush();
-    wal_writer.deinit();
 
     // Read starting from LSN 3
     var reader = try WALReader.init(allocator, "/tmp/test_reader_lsn", 3);

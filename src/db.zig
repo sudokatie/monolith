@@ -267,6 +267,71 @@ pub const DB = struct {
         return snap;
     }
 
+    /// Create a range iterator
+    /// Returns keys in [start, end) range in sorted order
+    /// Pass null for start to begin from first key
+    /// Pass null for end to iterate to last key
+    pub fn range(self: *DB, start: ?[]const u8, end: ?[]const u8) errors.MonolithError!*DBIterator {
+        if (self.state != .open) return errors.Error.NotOpen;
+
+        const iter = self.allocator.create(DBIterator) catch {
+            return errors.Error.OutOfSpace;
+        };
+        errdefer self.allocator.destroy(iter);
+
+        // Collect and sort keys in range
+        var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (keys.items) |k| self.allocator.free(k);
+            keys.deinit(self.allocator);
+        }
+
+        var chain_iter = self.mvcc.chains.iterator();
+        while (chain_iter.next()) |entry| {
+            const key = entry.key_ptr.*;
+
+            // Check range bounds
+            if (start) |s| {
+                if (std.mem.order(u8, key, s) == .lt) continue;
+            }
+            if (end) |e| {
+                if (std.mem.order(u8, key, e) != .lt) continue;
+            }
+
+            // Check visibility - only include if visible
+            const value = self.mvcc.get(key, 0, self.txn_manager.current_lsn, .read_committed);
+            if (value != null) {
+                const key_copy = self.allocator.dupe(u8, key) catch {
+                    return errors.Error.OutOfSpace;
+                };
+                keys.append(self.allocator, key_copy) catch {
+                    self.allocator.free(key_copy);
+                    return errors.Error.OutOfSpace;
+                };
+            }
+        }
+
+        // Sort keys
+        std.mem.sort([]const u8, keys.items, {}, struct {
+            fn cmp(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.cmp);
+
+        const owned_keys = keys.toOwnedSlice(self.allocator) catch {
+            return errors.Error.OutOfSpace;
+        };
+
+        iter.* = .{
+            .db = self,
+            .keys = owned_keys,
+            .index = 0,
+            .snapshot_lsn = self.txn_manager.current_lsn,
+        };
+
+        return iter;
+    }
+
     /// Force a checkpoint
     pub fn forceCheckpoint(self: *DB) errors.MonolithError!void {
         if (self.checkpoint) |ckpt| {
@@ -393,6 +458,47 @@ pub const DBStats = struct {
     active_txns: usize,
     total_keys: usize,
     total_versions: u64,
+};
+
+/// Key-value entry returned by range iterator
+pub const Entry = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// Range iterator for scanning key ranges
+pub const DBIterator = struct {
+    db: *DB,
+    keys: [][]const u8,
+    index: usize,
+    snapshot_lsn: LSN,
+
+    /// Get next entry in range
+    /// Returns null when iteration complete
+    pub fn next(self: *DBIterator) ?Entry {
+        if (self.index >= self.keys.len) return null;
+
+        const key = self.keys[self.index];
+        self.index += 1;
+
+        // Get value at snapshot
+        const value = self.db.mvcc.get(key, 0, self.snapshot_lsn, .read_committed);
+        if (value) |v| {
+            return Entry{ .key = key, .value = v };
+        }
+
+        // Key was deleted, try next
+        return self.next();
+    }
+
+    /// Close the iterator and free resources
+    pub fn close(self: *DBIterator) void {
+        for (self.keys) |key| {
+            self.db.allocator.free(key);
+        }
+        self.db.allocator.free(self.keys);
+        self.db.allocator.destroy(self);
+    }
 };
 
 // Tests
@@ -573,6 +679,77 @@ test "DB with WAL" {
 
     const v = try db.get("key");
     try std.testing.expectEqualStrings("value", v.?);
+}
+
+test "DB range scan" {
+    const allocator = std.testing.allocator;
+
+    std.fs.cwd().deleteTree("/tmp/test_db_range") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/test_db_range") catch {};
+
+    const db = try DB.open(allocator, "/tmp/test_db_range", .{ .enable_wal = false });
+    defer db.close();
+
+    // Insert some keys out of order
+    try db.put("cherry", "red");
+    try db.put("apple", "green");
+    try db.put("banana", "yellow");
+    try db.put("date", "brown");
+
+    // Full range scan
+    var iter = try db.range(null, null);
+    defer iter.close();
+
+    // Should be sorted
+    var entry = iter.next();
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqualStrings("apple", entry.?.key);
+
+    entry = iter.next();
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqualStrings("banana", entry.?.key);
+
+    entry = iter.next();
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqualStrings("cherry", entry.?.key);
+
+    entry = iter.next();
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqualStrings("date", entry.?.key);
+
+    entry = iter.next();
+    try std.testing.expect(entry == null);
+}
+
+test "DB range scan bounded" {
+    const allocator = std.testing.allocator;
+
+    std.fs.cwd().deleteTree("/tmp/test_db_range_bound") catch {};
+    defer std.fs.cwd().deleteTree("/tmp/test_db_range_bound") catch {};
+
+    const db = try DB.open(allocator, "/tmp/test_db_range_bound", .{ .enable_wal = false });
+    defer db.close();
+
+    try db.put("a", "1");
+    try db.put("b", "2");
+    try db.put("c", "3");
+    try db.put("d", "4");
+    try db.put("e", "5");
+
+    // Range [b, d) - should include b, c but not d
+    var iter = try db.range("b", "d");
+    defer iter.close();
+
+    var entry = iter.next();
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqualStrings("b", entry.?.key);
+
+    entry = iter.next();
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqualStrings("c", entry.?.key);
+
+    entry = iter.next();
+    try std.testing.expect(entry == null);
 }
 
 test "DBConfig defaults" {

@@ -1,5 +1,12 @@
 const std = @import("std");
 
+pub fn main() !void {
+    // Monolith is a library - use as a dependency
+    // See README.md for usage examples
+    const msg = "monolith: This is a library. Import it in your project.\nSee README.md for usage examples.\n";
+    _ = try std.posix.write(2, msg);
+}
+
 // Core types and errors
 pub const types = @import("core/types.zig");
 pub const errors = @import("core/errors.zig");
