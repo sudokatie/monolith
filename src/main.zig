@@ -15,6 +15,7 @@ pub const btree = @import("storage/btree.zig");
 
 // WAL components
 pub const wal_record = @import("wal/record.zig");
+pub const wal_writer = @import("wal/writer.zig");
 
 // Re-export commonly used types
 pub const PageId = types.PageId;
