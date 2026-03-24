@@ -28,6 +28,103 @@ const SplitResult = struct {
     new_page_id: PageId,
 };
 
+/// Key-value pair returned by iterator
+pub const KeyValue = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// B+ tree iterator for range scans
+pub const BTreeIterator = struct {
+    /// Reference to the tree
+    tree: *BTree,
+    /// Current leaf page ID
+    current_page_id: PageId,
+    /// Current slot index within leaf
+    current_slot: usize,
+    /// End key (exclusive), null means scan to end
+    end_key: ?[]const u8,
+    /// Whether iterator has been exhausted
+    exhausted: bool,
+    /// Allocator for copied keys/values
+    allocator: std.mem.Allocator,
+
+    /// Advance to next key-value pair
+    /// Returns null when iteration is complete
+    pub fn next(self: *BTreeIterator) !?KeyValue {
+        if (self.exhausted or self.current_page_id == INVALID_PAGE_ID) {
+            return null;
+        }
+
+        // Fetch current leaf
+        const frame = try self.tree.buffer_pool.fetchPage(self.current_page_id);
+        defer self.tree.buffer_pool.unpinPage(self.current_page_id, false);
+
+        var node = try BTreeNode.load(self.allocator, frame.buffer);
+
+        // Check if we've exhausted current leaf
+        if (self.current_slot >= node.key_count) {
+            // Move to right sibling
+            if (node.right_sibling == INVALID_PAGE_ID) {
+                self.exhausted = true;
+                return null;
+            }
+
+            self.current_page_id = node.right_sibling;
+            self.current_slot = 0;
+
+            // Recursively call next with new page
+            return self.next();
+        }
+
+        // Get current key
+        const key = node.getKey(self.current_slot) orelse {
+            self.exhausted = true;
+            return null;
+        };
+
+        // Check end bound
+        if (self.end_key) |end| {
+            if (compareKeys(key, end) != .less) {
+                self.exhausted = true;
+                return null;
+            }
+        }
+
+        // Get value
+        const value = node.getValue(self.current_slot) orelse {
+            self.exhausted = true;
+            return null;
+        };
+
+        // Copy key and value (buffer pool may evict the page)
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        const value_copy = try self.allocator.dupe(u8, value);
+
+        // Advance slot
+        self.current_slot += 1;
+
+        return KeyValue{
+            .key = key_copy,
+            .value = value_copy,
+        };
+    }
+
+    /// Free resources from a KeyValue returned by next()
+    pub fn freeKeyValue(self: *BTreeIterator, kv: KeyValue) void {
+        self.allocator.free(kv.key);
+        self.allocator.free(kv.value);
+    }
+
+    /// Reset iterator to beginning
+    pub fn reset(self: *BTreeIterator) void {
+        self.exhausted = false;
+        self.current_slot = 0;
+        // Need to re-seek to start
+    }
+};
+
 /// B+ tree for key-value storage
 pub const BTree = struct {
     /// Root page ID (INVALID_PAGE_ID if tree is empty)
@@ -420,6 +517,103 @@ pub const BTree = struct {
     /// Set the root page ID (used by insert/delete operations)
     pub fn setRoot(self: *BTree, root_id: PageId) void {
         self.root_id = root_id;
+    }
+
+    /// Create an iterator for a full scan (all keys in order)
+    pub fn scan(self: *BTree) !BTreeIterator {
+        return self.scanRange(null, null);
+    }
+
+    /// Create an iterator for a range scan
+    /// start_key: inclusive start (null = from beginning)
+    /// end_key: exclusive end (null = to end)
+    pub fn scanRange(self: *BTree, start_key: ?Key, end_key: ?Key) !BTreeIterator {
+        // Empty tree
+        if (self.root_id == INVALID_PAGE_ID) {
+            return BTreeIterator{
+                .tree = self,
+                .current_page_id = INVALID_PAGE_ID,
+                .current_slot = 0,
+                .end_key = end_key,
+                .exhausted = true,
+                .allocator = self.allocator,
+            };
+        }
+
+        // Find starting leaf and position
+        var leaf_id: PageId = undefined;
+        var slot: usize = undefined;
+
+        if (start_key) |sk| {
+            // Seek to start key
+            const result = try self.findLeafAndSlot(sk);
+            leaf_id = result.page_id;
+            slot = result.slot;
+        } else {
+            // Find leftmost leaf
+            leaf_id = try self.findLeftmostLeaf();
+            slot = 0;
+        }
+
+        return BTreeIterator{
+            .tree = self,
+            .current_page_id = leaf_id,
+            .current_slot = slot,
+            .end_key = end_key,
+            .exhausted = false,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Find the leftmost leaf page
+    fn findLeftmostLeaf(self: *BTree) !PageId {
+        var current_id = self.root_id;
+
+        while (true) {
+            const frame = try self.buffer_pool.fetchPage(current_id);
+            defer self.buffer_pool.unpinPage(current_id, false);
+
+            var node = try BTreeNode.load(self.allocator, frame.buffer);
+
+            if (node.is_leaf) {
+                return current_id;
+            }
+
+            // Go to leftmost child
+            const child_id = node.getChild(0) orelse return errors.Error.Corrupted;
+            current_id = child_id;
+        }
+    }
+
+    /// Find leaf page and slot for a key (for seek)
+    const LeafPosition = struct {
+        page_id: PageId,
+        slot: usize,
+    };
+
+    fn findLeafAndSlot(self: *BTree, key: Key) !LeafPosition {
+        var current_id = self.root_id;
+
+        while (true) {
+            const frame = try self.buffer_pool.fetchPage(current_id);
+            defer self.buffer_pool.unpinPage(current_id, false);
+
+            var node = try BTreeNode.load(self.allocator, frame.buffer);
+
+            if (node.is_leaf) {
+                const result = node.searchKey(key);
+                return LeafPosition{
+                    .page_id = current_id,
+                    .slot = result.index,
+                };
+            }
+
+            // Internal node - find child
+            const result = node.searchKey(key);
+            const child_index = if (result.found) result.index + 1 else result.index;
+            const child_id = node.getChild(child_index) orelse return errors.Error.Corrupted;
+            current_id = child_id;
+        }
     }
 };
 
@@ -829,4 +1023,192 @@ test "BTree delete last key" {
 
     const v = try tree.search("only");
     try std.testing.expect(v == null);
+}
+
+test "BTree full range scan" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_scan_full.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+
+    // Insert keys (out of order to test sorting)
+    try tree.insert("cherry", "red");
+    try tree.insert("apple", "green");
+    try tree.insert("banana", "yellow");
+    try tree.insert("date", "brown");
+    try tree.insert("elderberry", "purple");
+
+    // Full scan
+    var iter = try tree.scan();
+    var count: usize = 0;
+    var prev_key: ?[]const u8 = null;
+
+    while (try iter.next()) |kv| {
+        defer iter.freeKeyValue(kv);
+
+        // Verify sorted order
+        if (prev_key) |pk| {
+            try std.testing.expect(compareKeys(pk, kv.key) == .less);
+            allocator.free(pk);
+        }
+        prev_key = try allocator.dupe(u8, kv.key);
+        count += 1;
+    }
+    if (prev_key) |pk| allocator.free(pk);
+
+    try std.testing.expectEqual(@as(usize, 5), count);
+}
+
+test "BTree bounded range scan" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_scan_bounded.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+
+    // Insert keys
+    try tree.insert("a", "1");
+    try tree.insert("b", "2");
+    try tree.insert("c", "3");
+    try tree.insert("d", "4");
+    try tree.insert("e", "5");
+
+    // Scan from "b" to "d" (exclusive)
+    var iter = try tree.scanRange("b", "d");
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit(allocator);
+    }
+
+    while (try iter.next()) |kv| {
+        try keys.append(allocator, try allocator.dupe(u8, kv.key));
+        iter.freeKeyValue(kv);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), keys.items.len);
+    try std.testing.expectEqualStrings("b", keys.items[0]);
+    try std.testing.expectEqualStrings("c", keys.items[1]);
+}
+
+test "BTree empty range scan" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_scan_empty.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+
+    // Empty tree scan
+    var iter1 = try tree.scan();
+    try std.testing.expect(try iter1.next() == null);
+
+    // Insert some keys
+    try tree.insert("a", "1");
+    try tree.insert("c", "3");
+
+    // Scan empty range (nothing between b and b)
+    var iter2 = try tree.scanRange("b", "b");
+    try std.testing.expect(try iter2.next() == null);
+
+    // Scan range with no matching keys
+    var iter3 = try tree.scanRange("x", "z");
+    try std.testing.expect(try iter3.next() == null);
+}
+
+test "BTree range scan across multiple leaves" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_scan_multi.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+
+    // Insert enough keys to cause splits (multiple leaves)
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) {
+        var key_buf: [16]u8 = undefined;
+        var val_buf: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "key{d:0>5}", .{i}) catch unreachable;
+        const val = std.fmt.bufPrint(&val_buf, "val{d:0>5}", .{i}) catch unreachable;
+        try tree.insert(key, val);
+    }
+
+    // Full scan should return all 100 keys in order
+    var iter = try tree.scan();
+    var count: usize = 0;
+    var prev_key: ?[]const u8 = null;
+
+    while (try iter.next()) |kv| {
+        defer iter.freeKeyValue(kv);
+
+        // Verify sorted order
+        if (prev_key) |pk| {
+            try std.testing.expect(compareKeys(pk, kv.key) == .less);
+            allocator.free(pk);
+        }
+        prev_key = try allocator.dupe(u8, kv.key);
+        count += 1;
+    }
+    if (prev_key) |pk| allocator.free(pk);
+
+    try std.testing.expectEqual(@as(usize, 100), count);
+}
+
+test "BTree scan with start key only" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_scan_start.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+
+    try tree.insert("a", "1");
+    try tree.insert("b", "2");
+    try tree.insert("c", "3");
+    try tree.insert("d", "4");
+
+    // Scan from "c" to end
+    var iter = try tree.scanRange("c", null);
+    var count: usize = 0;
+
+    while (try iter.next()) |kv| {
+        defer iter.freeKeyValue(kv);
+        count += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), count);
 }
