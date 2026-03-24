@@ -327,10 +327,57 @@ pub const BTreeNode = struct {
         self.writeHeader();
     }
 
+    /// Remove key-value at position (for leaf nodes)
+    /// Note: Does not reclaim space - page compaction would be needed
+    pub fn removeAt(self: *BTreeNode, index: usize) void {
+        if (index >= self.key_count) return;
+
+        // Shift slots down to fill gap
+        var i: usize = index;
+        while (i < self.key_count - 1) : (i += 1) {
+            const next_slot = getSlotAt(self.buffer, DATA_START, i + 1);
+            setSlotAt(self.buffer, DATA_START, i, next_slot);
+        }
+
+        self.key_count -= 1;
+        self.writeHeader();
+    }
+
+    /// Remove key and child at position (for internal nodes)
+    /// Removes the key at index and the child at index+1
+    pub fn removeKeyChild(self: *BTreeNode, index: usize) void {
+        if (self.is_leaf or index >= self.key_count) return;
+
+        // Shift slots down
+        var i: usize = index;
+        while (i < self.key_count - 1) : (i += 1) {
+            const next_slot = getSlotAt(self.buffer, DATA_START, i + 1);
+            setSlotAt(self.buffer, DATA_START, i, next_slot);
+        }
+
+        // Shift children down (remove child at index+1)
+        i = index + 1;
+        while (i < self.key_count) : (i += 1) {
+            if (self.getChild(i + 1)) |c| {
+                self.setChild(i, c);
+            }
+        }
+
+        self.key_count -= 1;
+        self.writeHeader();
+    }
+
     /// Check if node is at least half full
     pub fn isHalfFull(self: *const BTreeNode) bool {
         const max_keys = maxKeysPerNode(self.page_size);
         return self.key_count >= max_keys / 2;
+    }
+
+    /// Check if node is underfull (less than half full)
+    pub fn isUnderfull(self: *const BTreeNode) bool {
+        if (self.key_count == 0) return true;
+        const max_keys = maxKeysPerNode(self.page_size);
+        return self.key_count < max_keys / 2;
     }
 };
 

@@ -337,6 +337,76 @@ pub const BTree = struct {
         return false;
     }
 
+    /// Delete a key from the tree
+    /// Returns true if key was found and deleted, false if not found
+    pub fn delete(self: *BTree, key: Key) !bool {
+        // Empty tree
+        if (self.root_id == INVALID_PAGE_ID) {
+            return false;
+        }
+
+        // Find and delete
+        const deleted = try self.deleteRecursive(self.root_id, key);
+
+        // Check if root is now empty (for internal nodes)
+        if (deleted) {
+            const frame = try self.buffer_pool.fetchPage(self.root_id);
+            var node = try BTreeNode.load(self.allocator, frame.buffer);
+            self.buffer_pool.unpinPage(self.root_id, false);
+
+            if (!node.is_leaf and node.key_count == 0) {
+                // Root is empty internal node - make first child the new root
+                if (node.getChild(0)) |new_root| {
+                    // TODO: free the old root page
+                    self.root_id = new_root;
+                }
+            } else if (node.is_leaf and node.key_count == 0) {
+                // Tree is now empty
+                // TODO: free the root page
+                self.root_id = INVALID_PAGE_ID;
+            }
+        }
+
+        return deleted;
+    }
+
+    /// Recursive delete - returns true if key was deleted
+    fn deleteRecursive(self: *BTree, page_id: PageId, key: Key) !bool {
+        const frame = try self.buffer_pool.fetchPage(page_id);
+        var node = try BTreeNode.load(self.allocator, frame.buffer);
+
+        if (node.is_leaf) {
+            // Search for key in leaf
+            const result = node.searchKey(key);
+            if (!result.found) {
+                self.buffer_pool.unpinPage(page_id, false);
+                return false;
+            }
+
+            // Remove the key
+            node.removeAt(result.index);
+            self.buffer_pool.unpinPage(page_id, true);
+
+            // Note: We're not doing merge/redistribute for simplicity
+            // A production implementation would handle underflow here
+            return true;
+        } else {
+            // Internal node - find child to descend to
+            const result = node.searchKey(key);
+            const child_index = if (result.found) result.index + 1 else result.index;
+            const child_id = node.getChild(child_index) orelse {
+                self.buffer_pool.unpinPage(page_id, false);
+                return false;
+            };
+
+            // Unpin parent before descending
+            self.buffer_pool.unpinPage(page_id, false);
+
+            // Recurse into child
+            return self.deleteRecursive(child_id, key);
+        }
+    }
+
     /// Get the root page ID
     pub fn getRootId(self: *const BTree) PageId {
         return self.root_id;
@@ -650,4 +720,113 @@ test "BTree insert duplicate key" {
     try std.testing.expect(v != null);
     try std.testing.expectEqualStrings("value1", v.?);
     allocator.free(v.?);
+}
+
+test "BTree delete existing key" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_delete1.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+
+    // Insert some keys
+    try tree.insert("apple", "red");
+    try tree.insert("banana", "yellow");
+    try tree.insert("cherry", "red");
+
+    // Delete one
+    const deleted = try tree.delete("banana");
+    try std.testing.expect(deleted);
+
+    // Verify it's gone
+    const v1 = try tree.search("banana");
+    try std.testing.expect(v1 == null);
+
+    // Other keys still there
+    const v2 = try tree.search("apple");
+    try std.testing.expect(v2 != null);
+    try std.testing.expectEqualStrings("red", v2.?);
+    allocator.free(v2.?);
+
+    const v3 = try tree.search("cherry");
+    try std.testing.expect(v3 != null);
+    try std.testing.expectEqualStrings("red", v3.?);
+    allocator.free(v3.?);
+}
+
+test "BTree delete non-existent key" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_delete_missing.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+
+    try tree.insert("apple", "red");
+
+    // Delete non-existent key
+    const deleted = try tree.delete("banana");
+    try std.testing.expect(!deleted);
+
+    // Original key still there
+    const v = try tree.search("apple");
+    try std.testing.expect(v != null);
+    allocator.free(v.?);
+}
+
+test "BTree delete from empty tree" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_delete_empty.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+
+    const deleted = try tree.delete("anything");
+    try std.testing.expect(!deleted);
+}
+
+test "BTree delete last key" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_delete_last.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+
+    try tree.insert("only", "key");
+
+    const deleted = try tree.delete("only");
+    try std.testing.expect(deleted);
+
+    // Tree should be empty now
+    try std.testing.expect(tree.isEmpty());
+
+    const v = try tree.search("only");
+    try std.testing.expect(v == null);
 }
