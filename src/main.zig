@@ -22,6 +22,7 @@ pub const wal_checkpoint = @import("wal/checkpoint.zig");
 // Transaction components
 pub const txn_manager = @import("txn/manager.zig");
 pub const txn_mvcc = @import("txn/mvcc.zig");
+pub const txn_lock = @import("txn/lock.zig");
 
 // Database API
 pub const db = @import("db.zig");
