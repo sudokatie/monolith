@@ -23,6 +23,9 @@ pub const wal_checkpoint = @import("wal/checkpoint.zig");
 pub const txn_manager = @import("txn/manager.zig");
 pub const txn_mvcc = @import("txn/mvcc.zig");
 
+// Database API
+pub const db = @import("db.zig");
+
 // Re-export commonly used types
 pub const PageId = types.PageId;
 pub const TransactionId = types.TransactionId;
