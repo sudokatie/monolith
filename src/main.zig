@@ -13,6 +13,9 @@ pub const buffer = @import("storage/buffer.zig");
 pub const btree_node = @import("storage/btree_node.zig");
 pub const btree = @import("storage/btree.zig");
 
+// WAL components
+pub const wal_record = @import("wal/record.zig");
+
 // Re-export commonly used types
 pub const PageId = types.PageId;
 pub const TransactionId = types.TransactionId;
