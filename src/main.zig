@@ -19,6 +19,9 @@ pub const wal_writer = @import("wal/writer.zig");
 pub const wal_recovery = @import("wal/recovery.zig");
 pub const wal_checkpoint = @import("wal/checkpoint.zig");
 
+// Transaction components
+pub const txn_manager = @import("txn/manager.zig");
+
 // Re-export commonly used types
 pub const PageId = types.PageId;
 pub const TransactionId = types.TransactionId;
