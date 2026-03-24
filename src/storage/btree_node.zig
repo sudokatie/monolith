@@ -327,6 +327,31 @@ pub const BTreeNode = struct {
         self.writeHeader();
     }
 
+    /// Update value at position (for leaf nodes)
+    /// Note: Old value space is not reclaimed - allocates new space for value
+    pub fn updateValueAt(self: *BTreeNode, index: usize, new_value: Value) !void {
+        if (!self.is_leaf) return errors.Error.InvalidPageType;
+        if (index >= self.key_count) return errors.Error.KeyNotFound;
+
+        // Check if we have space for the new value
+        const slot_area_end = DATA_START + (self.key_count + 1) * SLOT_SIZE;
+        const available = self.free_space - slot_area_end;
+        if (new_value.len > available) return errors.Error.ValueTooLarge;
+
+        // Allocate space for new value (grows downward)
+        self.free_space -= @intCast(new_value.len);
+        const value_offset = self.free_space;
+        @memcpy(self.buffer[value_offset .. value_offset + new_value.len], new_value);
+
+        // Update slot to point to new value
+        var slot = getSlotAt(self.buffer, DATA_START, index);
+        slot.value_offset = @intCast(value_offset);
+        slot.value_len = @intCast(new_value.len);
+        setSlotAt(self.buffer, DATA_START, index, slot);
+
+        self.writeHeader();
+    }
+
     /// Remove key-value at position (for leaf nodes)
     /// Note: Does not reclaim space - page compaction would be needed
     pub fn removeAt(self: *BTreeNode, index: usize) void {

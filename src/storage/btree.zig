@@ -137,6 +137,8 @@ pub const BTree = struct {
     allocator: std.mem.Allocator,
     /// Page size
     page_size: usize,
+    /// Pages freed by delete operations (can be recycled via freelist)
+    freed_pages: std.ArrayListUnmanaged(PageId),
 
     /// Initialize an empty B+ tree
     pub fn init(allocator: std.mem.Allocator, buffer_pool: *BufferPool, file: *File) BTree {
@@ -146,7 +148,25 @@ pub const BTree = struct {
             .file = file,
             .allocator = allocator,
             .page_size = buffer_pool.page_size,
+            .freed_pages = .{},
         };
+    }
+
+    /// Deinitialize and free resources
+    pub fn deinit(self: *BTree) void {
+        self.freed_pages.deinit(self.allocator);
+    }
+
+    /// Take ownership of freed pages (for recycling via freelist)
+    /// Caller is responsible for freeing the returned slice
+    pub fn takeFreedPages(self: *BTree) []PageId {
+        const pages = self.freed_pages.toOwnedSlice(self.allocator) catch return &[_]PageId{};
+        return pages;
+    }
+
+    /// Get count of freed pages awaiting reclamation
+    pub fn freedPageCount(self: *const BTree) usize {
+        return self.freed_pages.items.len;
     }
 
     /// Search for a key in the tree
@@ -237,8 +257,9 @@ pub const BTree = struct {
             const result = node.searchKey(key);
 
             if (result.found) {
-                // Update existing key - for now, just skip (could implement update)
-                self.buffer_pool.unpinPage(page_id, false);
+                // Update existing key's value
+                try node.updateValueAt(result.index, value);
+                self.buffer_pool.unpinPage(page_id, true);
                 return null;
             }
 
@@ -454,12 +475,13 @@ pub const BTree = struct {
             if (!node.is_leaf and node.key_count == 0) {
                 // Root is empty internal node - make first child the new root
                 if (node.getChild(0)) |new_root| {
-                    // TODO: free the old root page
+                    // Track old root for reclamation
+                    self.freed_pages.append(self.allocator, self.root_id) catch {};
                     self.root_id = new_root;
                 }
             } else if (node.is_leaf and node.key_count == 0) {
-                // Tree is now empty
-                // TODO: free the root page
+                // Tree is now empty - track root for reclamation
+                self.freed_pages.append(self.allocator, self.root_id) catch {};
                 self.root_id = INVALID_PAGE_ID;
             }
         }
@@ -632,6 +654,7 @@ test "BTree empty tree search" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     // Empty tree should return null for any key
     const result = try tree.search("anykey");
@@ -663,6 +686,7 @@ test "BTree single leaf search" {
 
     // Create tree with this leaf as root
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
     tree.setRoot(page_id);
 
     // Search for existing keys
@@ -725,6 +749,7 @@ test "BTree two level search" {
 
     // Create tree
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
     tree.setRoot(root_id);
 
     // Search left subtree
@@ -770,6 +795,7 @@ test "BTree isEmpty and getRootId" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     try std.testing.expect(tree.isEmpty());
     try std.testing.expectEqual(INVALID_PAGE_ID, tree.getRootId());
@@ -793,6 +819,7 @@ test "BTree insert single key" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     // Insert into empty tree
     try tree.insert("hello", "world");
@@ -818,6 +845,7 @@ test "BTree insert multiple keys" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     // Insert multiple keys
     try tree.insert("banana", "yellow");
@@ -860,6 +888,7 @@ test "BTree insert causing leaf split" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     // Insert enough keys to cause a split
     // With 4KB pages, we can fit many small keys before splitting
@@ -905,14 +934,15 @@ test "BTree insert duplicate key" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     try tree.insert("key", "value1");
-    try tree.insert("key", "value2"); // Duplicate - currently skipped
+    try tree.insert("key", "value2"); // Duplicate - updates existing value
 
-    // Should still have original value (update not implemented yet)
+    // Should have updated value
     const v = try tree.search("key");
     try std.testing.expect(v != null);
-    try std.testing.expectEqualStrings("value1", v.?);
+    try std.testing.expectEqualStrings("value2", v.?);
     allocator.free(v.?);
 }
 
@@ -929,6 +959,7 @@ test "BTree delete existing key" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     // Insert some keys
     try tree.insert("apple", "red");
@@ -968,6 +999,7 @@ test "BTree delete non-existent key" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     try tree.insert("apple", "red");
 
@@ -994,6 +1026,7 @@ test "BTree delete from empty tree" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     const deleted = try tree.delete("anything");
     try std.testing.expect(!deleted);
@@ -1012,6 +1045,7 @@ test "BTree delete last key" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     try tree.insert("only", "key");
 
@@ -1038,6 +1072,7 @@ test "BTree full range scan" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     // Insert keys (out of order to test sorting)
     try tree.insert("cherry", "red");
@@ -1080,6 +1115,7 @@ test "BTree bounded range scan" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     // Insert keys
     try tree.insert("a", "1");
@@ -1119,6 +1155,7 @@ test "BTree empty range scan" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     // Empty tree scan
     var iter1 = try tree.scan();
@@ -1150,6 +1187,7 @@ test "BTree range scan across multiple leaves" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     // Insert enough keys to cause splits (multiple leaves)
     var i: u32 = 0;
@@ -1195,6 +1233,7 @@ test "BTree scan with start key only" {
     defer pool.deinit();
 
     var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
 
     try tree.insert("a", "1");
     try tree.insert("b", "2");
