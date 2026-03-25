@@ -593,6 +593,11 @@ pub const RangeIterator = struct {
         }
     }
 
+    /// Close the iterator (alias for deinit, matches spec API)
+    pub fn close(self: *RangeIterator) void {
+        self.deinit();
+    }
+
     /// Get next key-value pair (caller owns returned memory)
     pub fn next(self: *RangeIterator) !?KeyValue {
         if (self.exhausted or self.current_page_id == INVALID_PAGE_ID) {
