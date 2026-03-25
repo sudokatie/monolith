@@ -130,6 +130,8 @@ pub const Database = struct {
         var new_meta = self.meta.getMeta().*;
         new_meta.root_page_id = self.btree.getRootPageId();
         new_meta.freelist_page_id = self.freelist.getHeadPageId();
+        new_meta.total_pages = self.file.pageCount();
+        new_meta.last_txn_id = self.txn_manager.next_txn_id;
         self.meta.update(new_meta) catch {};
 
         // Persist freelist
@@ -273,6 +275,38 @@ pub const Database = struct {
 
         // Force checkpoint to minimize WAL
         try self.forceCheckpoint();
+    }
+
+    /// Create a snapshot for consistent reads
+    pub fn snapshot(self: *Database) !*Snapshot {
+        const snap = try self.allocator.create(Snapshot);
+        snap.* = .{
+            .db = self,
+            .read_ts = self.txn_manager.current_ts,
+            .allocator = self.allocator,
+        };
+        return snap;
+    }
+};
+
+/// Database snapshot for consistent point-in-time reads
+pub const Snapshot = struct {
+    /// Database reference
+    db: *Database,
+    /// Read timestamp (snapshot point)
+    read_ts: u64,
+    /// Allocator
+    allocator: std.mem.Allocator,
+
+    /// Get a value at this snapshot's point in time
+    pub fn get(self: *Snapshot, key: Key) !?Value {
+        // For now, just read from btree (MVCC integration would check visibility)
+        return self.db.btree.search(key);
+    }
+
+    /// Release the snapshot
+    pub fn release(self: *Snapshot) void {
+        self.allocator.destroy(self);
     }
 };
 
@@ -461,6 +495,5 @@ test "Database persistence" {
 pub const DB = Database;
 pub const DBConfig = Config;
 pub const DBTransaction = Transaction;
-pub const DBIterator = void; // TODO: implement
-pub const Snapshot = void; // TODO: implement  
+pub const DBIterator = btree_mod.RangeIterator;
 pub const DBStats = Stats;

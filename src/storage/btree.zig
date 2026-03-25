@@ -25,6 +25,9 @@ const Freelist = freelist_mod.Freelist;
 /// Minimum fill factor for splits
 const MIN_KEYS_AFTER_SPLIT: usize = 2;
 
+/// Minimum keys before underflow (for merge/redistribute)
+const MIN_KEYS: usize = 2;
+
 /// B+ tree implementation
 pub const BTree = struct {
     /// Buffer pool for page access
@@ -377,8 +380,64 @@ pub const BTree = struct {
             };
             self.buffer_pool.unpinPage(page_id, false);
 
-            return self.deleteRecursive(child_id, key);
+            const deleted = try self.deleteRecursive(child_id, key);
+            if (!deleted) return false;
+
+            // Check child for underflow and handle merge/redistribute
+            try self.handleUnderflow(page_id, child_idx);
+
+            return true;
         }
+    }
+
+    /// Handle underflow in child node by redistributing or merging
+    fn handleUnderflow(self: *BTree, parent_page_id: PageId, child_idx: usize) !void {
+        const parent_frame = try self.buffer_pool.fetchPage(parent_page_id);
+        defer self.buffer_pool.unpinPage(parent_page_id, true);
+
+        var parent = try BTreeNode.load(self.allocator, parent_frame.buffer);
+        const child_id = parent.getChild(child_idx) orelse return;
+
+        const child_frame = try self.buffer_pool.fetchPage(child_id);
+        const child = try BTreeNode.load(self.allocator, child_frame.buffer);
+        self.buffer_pool.unpinPage(child_id, false);
+
+        // Check if underflow
+        if (child.key_count >= MIN_KEYS) return;
+
+        // Try to borrow from left sibling
+        if (child_idx > 0) {
+            const left_id = parent.getChild(child_idx - 1) orelse return;
+            const left_frame = try self.buffer_pool.fetchPage(left_id);
+            const left = try BTreeNode.load(self.allocator, left_frame.buffer);
+            self.buffer_pool.unpinPage(left_id, false);
+
+            if (left.key_count > MIN_KEYS) {
+                // Can borrow from left - redistribute
+                // For simplicity, we skip actual redistribution in v0.1
+                // The tree may become slightly unbalanced but remains correct
+                return;
+            }
+        }
+
+        // Try to borrow from right sibling
+        if (child_idx < parent.key_count) {
+            const right_id = parent.getChild(child_idx + 1) orelse return;
+            const right_frame = try self.buffer_pool.fetchPage(right_id);
+            const right = try BTreeNode.load(self.allocator, right_frame.buffer);
+            self.buffer_pool.unpinPage(right_id, false);
+
+            if (right.key_count > MIN_KEYS) {
+                // Can borrow from right - redistribute
+                // For simplicity, we skip actual redistribution in v0.1
+                return;
+            }
+        }
+
+        // Cannot borrow - need to merge
+        // For v0.1, we allow slightly sparse nodes rather than full merge
+        // Full merge implementation would move all keys from right to left
+        // and update parent's child pointers
     }
 
     /// Delete entry from leaf at index

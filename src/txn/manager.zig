@@ -72,6 +72,11 @@ pub const Transaction = struct {
         self.manager.onAbort(self.id);
     }
 
+    /// Rollback the transaction (alias for abort)
+    pub fn rollback(self: *Transaction) !void {
+        return self.abort();
+    }
+
     /// Log an insert operation
     pub fn logInsert(self: *Transaction, page_id: PageId, key: Key, value: Value) !LSN {
         if (self.state != .active) {

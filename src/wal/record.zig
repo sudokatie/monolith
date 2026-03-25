@@ -240,6 +240,82 @@ pub const DeleteData = struct {
     }
 };
 
+/// Update record data format (includes old_value for undo)
+/// Layout:
+///   0-7:   page_id (u64)
+///   8-9:   key_len (u16)
+///   10-11: old_value_len (u16)
+///   12-13: new_value_len (u16)
+///   14+:   key data
+///   14+key_len+: old_value data
+///   14+key_len+old_value_len+: new_value data
+pub const UpdateData = struct {
+    page_id: PageId,
+    key: []const u8,
+    old_value: []const u8,
+    new_value: []const u8,
+
+    pub fn serializedSize(self: *const UpdateData) usize {
+        return 14 + self.key.len + self.old_value.len + self.new_value.len;
+    }
+
+    pub fn serialize(self: *const UpdateData, buffer: []u8) void {
+        @memcpy(buffer[0..8], std.mem.asBytes(&self.page_id));
+        const key_len: u16 = @intCast(self.key.len);
+        const old_len: u16 = @intCast(self.old_value.len);
+        const new_len: u16 = @intCast(self.new_value.len);
+        @memcpy(buffer[8..10], std.mem.asBytes(&key_len));
+        @memcpy(buffer[10..12], std.mem.asBytes(&old_len));
+        @memcpy(buffer[12..14], std.mem.asBytes(&new_len));
+
+        var offset: usize = 14;
+        @memcpy(buffer[offset .. offset + self.key.len], self.key);
+        offset += self.key.len;
+        @memcpy(buffer[offset .. offset + self.old_value.len], self.old_value);
+        offset += self.old_value.len;
+        @memcpy(buffer[offset .. offset + self.new_value.len], self.new_value);
+    }
+
+    pub fn deserialize(buffer: []const u8, allocator: std.mem.Allocator) !UpdateData {
+        if (buffer.len < 14) return errors.Error.InvalidWALRecord;
+
+        const page_id = std.mem.bytesToValue(PageId, buffer[0..8]);
+        const key_len = std.mem.bytesToValue(u16, buffer[8..10]);
+        const old_len = std.mem.bytesToValue(u16, buffer[10..12]);
+        const new_len = std.mem.bytesToValue(u16, buffer[12..14]);
+
+        const total_len = 14 + key_len + old_len + new_len;
+        if (buffer.len < total_len) {
+            return errors.Error.InvalidWALRecord;
+        }
+
+        var offset: usize = 14;
+        const key = try allocator.alloc(u8, key_len);
+        @memcpy(key, buffer[offset .. offset + key_len]);
+        offset += key_len;
+
+        const old_value = try allocator.alloc(u8, old_len);
+        @memcpy(old_value, buffer[offset .. offset + old_len]);
+        offset += old_len;
+
+        const new_value = try allocator.alloc(u8, new_len);
+        @memcpy(new_value, buffer[offset .. offset + new_len]);
+
+        return .{
+            .page_id = page_id,
+            .key = key,
+            .old_value = old_value,
+            .new_value = new_value,
+        };
+    }
+
+    pub fn deinit(self: *UpdateData, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+        allocator.free(self.old_value);
+        allocator.free(self.new_value);
+    }
+};
+
 /// Checkpoint data format
 pub const CheckpointData = struct {
     /// Active transaction IDs at checkpoint time
