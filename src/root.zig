@@ -14,6 +14,7 @@ pub const freelist = @import("storage/freelist.zig");
 pub const buffer = @import("storage/buffer.zig");
 pub const btree_node = @import("storage/btree_node.zig");
 pub const btree = @import("storage/btree.zig");
+pub const overflow = @import("storage/overflow.zig");
 
 // Write-ahead log
 pub const wal_record = @import("wal/record.zig");

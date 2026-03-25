@@ -329,23 +329,85 @@ pub const LockManager = struct {
         return .waiting;
     }
 
-    /// Try to acquire with wait (simplified - just returns waiting/denied)
+    /// Try to acquire page lock with timeout-based waiting
     pub fn tryLockPageWithWait(
         self: *LockManager,
         page_id: PageId,
         txn_id: TransactionId,
         mode: LockMode,
     ) errors.MonolithError!LockStatus {
-        const status = try self.lockPage(page_id, txn_id, mode);
+        return self.lockWithTimeout(page_id, null, txn_id, mode, self.default_timeout_ns);
+    }
 
-        if (status == .waiting) {
-            // In a real implementation, would wait with timeout
-            // For now, just return waiting
-            self.lock_timeouts += 1;
-            return .denied;
+    /// Try to acquire key lock with timeout-based waiting
+    pub fn tryLockKeyWithWait(
+        self: *LockManager,
+        key: []const u8,
+        txn_id: TransactionId,
+        mode: LockMode,
+    ) errors.MonolithError!LockStatus {
+        const key_hash = std.hash.Wyhash.hash(0, key);
+        return self.lockWithTimeout(null, key_hash, txn_id, mode, self.default_timeout_ns);
+    }
+
+    /// Internal: acquire lock with timeout
+    fn lockWithTimeout(
+        self: *LockManager,
+        page_id: ?PageId,
+        key_hash: ?u64,
+        txn_id: TransactionId,
+        mode: LockMode,
+        timeout_ns: u64,
+    ) errors.MonolithError!LockStatus {
+        const start_time = std.time.nanoTimestamp();
+        const deadline = start_time + @as(i128, timeout_ns);
+
+        // Spin interval starts small and grows
+        var spin_ns: u64 = 1000; // 1 microsecond
+        const max_spin_ns: u64 = 10_000_000; // 10 milliseconds
+
+        while (true) {
+            // Try to acquire lock
+            const status = if (page_id) |pid|
+                try self.lockPage(pid, txn_id, mode)
+            else if (key_hash) |kh|
+                try self.lockKeyHash(kh, txn_id, mode)
+            else
+                return .denied;
+
+            if (status == .granted) {
+                return .granted;
+            }
+
+            // Check timeout
+            const now = std.time.nanoTimestamp();
+            if (now >= deadline) {
+                self.lock_timeouts += 1;
+                return .denied;
+            }
+
+            // Sleep with exponential backoff
+            std.time.sleep(spin_ns);
+            spin_ns = @min(spin_ns * 2, max_spin_ns);
+        }
+    }
+
+    /// Lock a key by its hash (internal)
+    fn lockKeyHash(
+        self: *LockManager,
+        key_hash: u64,
+        txn_id: TransactionId,
+        mode: LockMode,
+    ) errors.MonolithError!LockStatus {
+        const result = self.key_locks.getOrPut(key_hash) catch {
+            return errors.Error.OutOfSpace;
+        };
+
+        if (!result.found_existing) {
+            result.value_ptr.* = LockEntry.init(self.allocator);
         }
 
-        return status;
+        return self.acquireLock(result.value_ptr, txn_id, mode);
     }
 
     /// Get lock statistics

@@ -5,6 +5,7 @@ const btree_node = @import("btree_node.zig");
 const buffer_mod = @import("buffer.zig");
 const page_mod = @import("page.zig");
 const file_mod = @import("file.zig");
+const overflow_mod = @import("overflow.zig");
 
 const PageId = types.PageId;
 const PageType = types.PageType;
@@ -19,6 +20,7 @@ const BTreeNode = btree_node.BTreeNode;
 const SearchResult = btree_node.SearchResult;
 const BufferPool = buffer_mod.BufferPool;
 const File = file_mod.File;
+const OverflowManager = overflow_mod.OverflowManager;
 
 /// Split result returned when a node splits
 const SplitResult = struct {
@@ -92,15 +94,23 @@ pub const BTreeIterator = struct {
         }
 
         // Get value
-        const value = node.getValue(self.current_slot) orelse {
+        const raw_value = node.getValue(self.current_slot) orelse {
             self.exhausted = true;
             return null;
         };
 
-        // Copy key and value (buffer pool may evict the page)
+        // Copy key (buffer pool may evict the page)
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
-        const value_copy = try self.allocator.dupe(u8, value);
+
+        // Handle overflow values
+        var value_copy: []u8 = undefined;
+        if (overflow_mod.isOverflowPointer(raw_value)) {
+            const overflow_page = overflow_mod.getOverflowPageId(raw_value);
+            value_copy = try self.tree.overflow_manager.readValue(overflow_page);
+        } else {
+            value_copy = try self.allocator.dupe(u8, raw_value);
+        }
 
         // Advance slot
         self.current_slot += 1;
@@ -139,9 +149,16 @@ pub const BTree = struct {
     page_size: usize,
     /// Pages freed by delete operations (can be recycled via freelist)
     freed_pages: std.ArrayListUnmanaged(PageId),
+    /// Fill factor for splits (0.5 to 1.0, default 0.7)
+    fill_factor: f32,
+    /// Minimum keys threshold (below this triggers merge/redistribute)
+    min_keys: usize,
+    /// Overflow page manager for large values
+    overflow_manager: OverflowManager,
 
     /// Initialize an empty B+ tree
     pub fn init(allocator: std.mem.Allocator, buffer_pool: *BufferPool, file: *File) BTree {
+        const max_keys = btree_node.maxKeysPerNode(buffer_pool.page_size);
         return .{
             .root_id = INVALID_PAGE_ID,
             .buffer_pool = buffer_pool,
@@ -149,11 +166,15 @@ pub const BTree = struct {
             .allocator = allocator,
             .page_size = buffer_pool.page_size,
             .freed_pages = .{},
+            .fill_factor = 0.7,
+            .min_keys = max_keys / 4, // 25% minimum occupancy
+            .overflow_manager = OverflowManager.init(allocator, buffer_pool, file),
         };
     }
 
     /// Deinitialize and free resources
     pub fn deinit(self: *BTree) void {
+        self.overflow_manager.deinit();
         self.freed_pages.deinit(self.allocator);
     }
 
@@ -171,6 +192,7 @@ pub const BTree = struct {
 
     /// Search for a key in the tree
     /// Returns the value if found, null otherwise
+    /// Caller must free the returned slice
     pub fn search(self: *BTree, key: Key) !?Value {
         // Empty tree
         if (self.root_id == INVALID_PAGE_ID) {
@@ -192,8 +214,16 @@ pub const BTree = struct {
                 // Search in leaf node
                 const result = node.searchKey(key);
                 if (result.found) {
-                    // Return a copy of the value to avoid buffer pool issues
                     if (node.getValue(result.index)) |val| {
+                        // Check if this is an overflow pointer
+                        if (overflow_mod.isOverflowPointer(val)) {
+                            const overflow_page = overflow_mod.getOverflowPageId(val);
+                            const overflow_val = self.overflow_manager.readValue(overflow_page) catch |err| {
+                                return err;
+                            };
+                            return overflow_val;
+                        }
+                        // Regular value - return a copy
                         const copy = try self.allocator.dupe(u8, val);
                         return copy;
                     }
@@ -214,14 +244,30 @@ pub const BTree = struct {
     }
 
     /// Insert a key-value pair into the tree
+    /// Handles overflow pages for large values automatically
     pub fn insert(self: *BTree, key: Key, value: Value) !void {
+        // Check if value needs overflow pages
+        var stored_value: []const u8 = undefined;
+        var overflow_pointer: [16]u8 = undefined;
+        var needs_overflow = false;
+
+        if (self.overflow_manager.needsOverflow(value.len)) {
+            // Store in overflow pages
+            const overflow_page = try self.overflow_manager.storeValue(value);
+            overflow_pointer = overflow_mod.makeOverflowPointer(overflow_page);
+            stored_value = &overflow_pointer;
+            needs_overflow = true;
+        } else {
+            stored_value = value;
+        }
+
         // Empty tree - create root leaf
         if (self.root_id == INVALID_PAGE_ID) {
             const page_id = try self.file.allocatePage();
             const frame = try self.buffer_pool.newPage(page_id, .leaf);
 
             var node = BTreeNode.init(self.allocator, frame.buffer, true);
-            try node.insertAt(0, key, value);
+            try node.insertAt(0, key, stored_value);
             self.buffer_pool.unpinPage(page_id, true);
 
             self.root_id = page_id;
@@ -229,7 +275,7 @@ pub const BTree = struct {
         }
 
         // Find path to leaf and insert
-        const split = try self.insertRecursive(self.root_id, key, value);
+        const split = try self.insertRecursive(self.root_id, key, stored_value, needs_overflow);
 
         // If root split, create new root
         if (split) |s| {
@@ -248,7 +294,8 @@ pub const BTree = struct {
     }
 
     /// Recursive insert - returns split info if node split
-    fn insertRecursive(self: *BTree, page_id: PageId, key: Key, value: Value) !?SplitResult {
+    fn insertRecursive(self: *BTree, page_id: PageId, key: Key, value: Value, is_overflow: bool) !?SplitResult {
+        _ = is_overflow; // Used for tracking, actual value already converted
         const frame = try self.buffer_pool.fetchPage(page_id);
         var node = try BTreeNode.load(self.allocator, frame.buffer);
 
@@ -257,7 +304,19 @@ pub const BTree = struct {
             const result = node.searchKey(key);
 
             if (result.found) {
-                // Update existing key's value
+                // Update existing key's value - free old overflow pages if needed
+                if (node.getValue(result.index)) |old_val| {
+                    if (overflow_mod.isOverflowPointer(old_val)) {
+                        const old_overflow = overflow_mod.getOverflowPageId(old_val);
+                        self.overflow_manager.freeValue(old_overflow) catch {};
+                        // Collect freed pages
+                        const freed = self.overflow_manager.takeFreedPages();
+                        for (freed) |p| {
+                            self.freed_pages.append(self.allocator, p) catch {};
+                        }
+                        self.allocator.free(freed);
+                    }
+                }
                 try node.updateValueAt(result.index, value);
                 self.buffer_pool.unpinPage(page_id, true);
                 return null;
@@ -288,7 +347,7 @@ pub const BTree = struct {
             self.buffer_pool.unpinPage(page_id, false);
 
             // Recurse into child
-            const child_split = try self.insertRecursive(child_id, key, value);
+            const child_split = try self.insertRecursive(child_id, key, value, false);
 
             if (child_split) |cs| {
                 // Child split - need to insert new key into this node
@@ -321,9 +380,9 @@ pub const BTree = struct {
         const new_frame = try self.buffer_pool.newPage(new_page_id, .leaf);
         var new_node = BTreeNode.init(self.allocator, new_frame.buffer, true);
 
-        // Calculate split point (half of keys go to new node)
+        // Calculate split point based on fill factor
         const total_keys = node.key_count + 1; // including the new key
-        const split_point = total_keys / 2;
+        const split_point = @as(usize, @intFromFloat(@as(f32, @floatFromInt(total_keys)) * self.fill_factor));
 
         // Collect all keys and values (including new one)
         var keys: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -418,7 +477,7 @@ pub const BTree = struct {
         }
 
         const total_keys = keys.items.len;
-        const split_point = total_keys / 2;
+        const split_point = @as(usize, @intFromFloat(@as(f32, @floatFromInt(total_keys)) * self.fill_factor));
 
         // The middle key goes up to parent
         const split_key = try self.allocator.dupe(u8, keys.items[split_point]);
@@ -489,8 +548,27 @@ pub const BTree = struct {
         return deleted;
     }
 
-    /// Recursive delete - returns true if key was deleted
+    /// Result of delete indicating if rebalancing is needed
+    const DeleteResult = struct {
+        deleted: bool,
+        underflow: bool,
+    };
+
+    /// Recursive delete - returns true if key was deleted and whether node underflowed
     fn deleteRecursive(self: *BTree, page_id: PageId, key: Key) !bool {
+        const result = try self.deleteRecursiveInternal(page_id, key, null, null, null);
+        return result.deleted;
+    }
+
+    /// Internal recursive delete with parent context for rebalancing
+    fn deleteRecursiveInternal(
+        self: *BTree,
+        page_id: PageId,
+        key: Key,
+        parent_id: ?PageId,
+        parent_child_idx: ?usize,
+        _: ?usize, // parent_key_idx - reserved for future use
+    ) !DeleteResult {
         const frame = try self.buffer_pool.fetchPage(page_id);
         var node = try BTreeNode.load(self.allocator, frame.buffer);
 
@@ -499,31 +577,360 @@ pub const BTree = struct {
             const result = node.searchKey(key);
             if (!result.found) {
                 self.buffer_pool.unpinPage(page_id, false);
-                return false;
+                return .{ .deleted = false, .underflow = false };
+            }
+
+            // Free overflow pages if the value is an overflow pointer
+            if (node.getValue(result.index)) |val| {
+                if (overflow_mod.isOverflowPointer(val)) {
+                    const overflow_page = overflow_mod.getOverflowPageId(val);
+                    self.overflow_manager.freeValue(overflow_page) catch {};
+                    // Collect freed pages
+                    const freed = self.overflow_manager.takeFreedPages();
+                    for (freed) |p| {
+                        self.freed_pages.append(self.allocator, p) catch {};
+                    }
+                    self.allocator.free(freed);
+                }
             }
 
             // Remove the key
             node.removeAt(result.index);
             self.buffer_pool.unpinPage(page_id, true);
 
-            // Note: We're not doing merge/redistribute for simplicity
-            // A production implementation would handle underflow here
-            return true;
+            // Check for underflow (not applicable to root)
+            const underflow = parent_id != null and node.key_count < self.min_keys;
+
+            if (underflow) {
+                try self.handleUnderflow(page_id, parent_id.?, parent_child_idx.?, true);
+            }
+
+            return .{ .deleted = true, .underflow = underflow };
         } else {
             // Internal node - find child to descend to
             const result = node.searchKey(key);
             const child_index = if (result.found) result.index + 1 else result.index;
             const child_id = node.getChild(child_index) orelse {
                 self.buffer_pool.unpinPage(page_id, false);
-                return false;
+                return .{ .deleted = false, .underflow = false };
             };
 
             // Unpin parent before descending
             self.buffer_pool.unpinPage(page_id, false);
 
             // Recurse into child
-            return self.deleteRecursive(child_id, key);
+            const key_idx = if (result.found) result.index else if (child_index > 0) child_index - 1 else null;
+            const del_result = try self.deleteRecursiveInternal(child_id, key, page_id, child_index, key_idx);
+
+            if (!del_result.deleted) {
+                return del_result;
+            }
+
+            // Re-fetch this node to check for internal underflow
+            const reframe = try self.buffer_pool.fetchPage(page_id);
+            const renode = try BTreeNode.load(self.allocator, reframe.buffer);
+            self.buffer_pool.unpinPage(page_id, false);
+
+            // Check if this internal node now underflows
+            const underflow = parent_id != null and renode.key_count < self.min_keys;
+
+            if (underflow) {
+                try self.handleUnderflow(page_id, parent_id.?, parent_child_idx.?, false);
+            }
+
+            return .{ .deleted = true, .underflow = underflow };
         }
+    }
+
+    /// Handle underflow by redistributing or merging with sibling
+    fn handleUnderflow(self: *BTree, page_id: PageId, parent_id: PageId, child_idx: usize, is_leaf: bool) !void {
+        // Get parent node
+        const parent_frame = try self.buffer_pool.fetchPage(parent_id);
+        var parent_node = try BTreeNode.load(self.allocator, parent_frame.buffer);
+
+        // Try to redistribute from left sibling first
+        if (child_idx > 0) {
+            const left_sibling_id = parent_node.getChild(child_idx - 1) orelse {
+                self.buffer_pool.unpinPage(parent_id, false);
+                return;
+            };
+
+            const left_frame = try self.buffer_pool.fetchPage(left_sibling_id);
+            const left_node = try BTreeNode.load(self.allocator, left_frame.buffer);
+
+            // Can redistribute if left sibling has more than minimum
+            if (left_node.key_count > self.min_keys) {
+                try self.redistributeFromLeft(page_id, left_sibling_id, parent_id, child_idx - 1, is_leaf);
+                self.buffer_pool.unpinPage(left_sibling_id, true);
+                self.buffer_pool.unpinPage(parent_id, true);
+                return;
+            }
+
+            // Otherwise merge with left sibling
+            try self.mergeWithLeft(page_id, left_sibling_id, parent_id, child_idx - 1, is_leaf);
+            self.buffer_pool.unpinPage(left_sibling_id, true);
+            self.buffer_pool.unpinPage(parent_id, true);
+            return;
+        }
+
+        // Try right sibling
+        if (child_idx < parent_node.key_count) {
+            const right_sibling_id = parent_node.getChild(child_idx + 1) orelse {
+                self.buffer_pool.unpinPage(parent_id, false);
+                return;
+            };
+
+            const right_frame = try self.buffer_pool.fetchPage(right_sibling_id);
+            const right_node = try BTreeNode.load(self.allocator, right_frame.buffer);
+
+            // Can redistribute if right sibling has more than minimum
+            if (right_node.key_count > self.min_keys) {
+                try self.redistributeFromRight(page_id, right_sibling_id, parent_id, child_idx, is_leaf);
+                self.buffer_pool.unpinPage(right_sibling_id, true);
+                self.buffer_pool.unpinPage(parent_id, true);
+                return;
+            }
+
+            // Otherwise merge with right sibling
+            try self.mergeWithRight(page_id, right_sibling_id, parent_id, child_idx, is_leaf);
+            self.buffer_pool.unpinPage(right_sibling_id, true);
+            self.buffer_pool.unpinPage(parent_id, true);
+            return;
+        }
+
+        self.buffer_pool.unpinPage(parent_id, false);
+    }
+
+    /// Redistribute a key from left sibling
+    fn redistributeFromLeft(
+        self: *BTree,
+        page_id: PageId,
+        left_id: PageId,
+        parent_id: PageId,
+        separator_idx: usize,
+        is_leaf: bool,
+    ) !void {
+        const frame = try self.buffer_pool.fetchPage(page_id);
+        var node = try BTreeNode.load(self.allocator, frame.buffer);
+        defer self.buffer_pool.unpinPage(page_id, true);
+
+        const left_frame = try self.buffer_pool.fetchPage(left_id);
+        var left_node = try BTreeNode.load(self.allocator, left_frame.buffer);
+        defer self.buffer_pool.unpinPage(left_id, true);
+
+        const parent_frame = try self.buffer_pool.fetchPage(parent_id);
+        var parent_node = try BTreeNode.load(self.allocator, parent_frame.buffer);
+        defer self.buffer_pool.unpinPage(parent_id, true);
+
+        if (is_leaf) {
+            // Move last key-value from left sibling to this node
+            const last_key = left_node.getKey(left_node.key_count - 1) orelse return;
+            const last_value = left_node.getValue(left_node.key_count - 1) orelse return;
+
+            // Insert at beginning of this node
+            try node.insertAt(0, last_key, last_value);
+
+            // Remove from left sibling
+            left_node.removeAt(left_node.key_count - 1);
+
+            // Update parent separator
+            if (node.getKey(0)) |new_sep| {
+                parent_node.updateKeyAt(separator_idx, new_sep) catch {};
+            }
+        } else {
+            // For internal nodes, rotate through parent
+            const parent_key = parent_node.getKey(separator_idx) orelse return;
+            const left_last_key = left_node.getKey(left_node.key_count - 1) orelse return;
+            const left_last_child = left_node.getChild(left_node.key_count) orelse return;
+
+            // Insert parent key at beginning with left's last child
+            try node.insertKeyChild(0, parent_key, node.getChild(0) orelse return);
+            node.setChild(0, left_last_child);
+
+            // Move left's last key to parent
+            parent_node.updateKeyAt(separator_idx, left_last_key) catch {};
+
+            // Remove last key from left (keep the children pointer logic)
+            left_node.removeKeyAt(left_node.key_count - 1);
+        }
+    }
+
+    /// Redistribute a key from right sibling
+    fn redistributeFromRight(
+        self: *BTree,
+        page_id: PageId,
+        right_id: PageId,
+        parent_id: PageId,
+        separator_idx: usize,
+        is_leaf: bool,
+    ) !void {
+        const frame = try self.buffer_pool.fetchPage(page_id);
+        var node = try BTreeNode.load(self.allocator, frame.buffer);
+        defer self.buffer_pool.unpinPage(page_id, true);
+
+        const right_frame = try self.buffer_pool.fetchPage(right_id);
+        var right_node = try BTreeNode.load(self.allocator, right_frame.buffer);
+        defer self.buffer_pool.unpinPage(right_id, true);
+
+        const parent_frame = try self.buffer_pool.fetchPage(parent_id);
+        var parent_node = try BTreeNode.load(self.allocator, parent_frame.buffer);
+        defer self.buffer_pool.unpinPage(parent_id, true);
+
+        if (is_leaf) {
+            // Move first key-value from right sibling to this node
+            const first_key = right_node.getKey(0) orelse return;
+            const first_value = right_node.getValue(0) orelse return;
+
+            // Insert at end of this node
+            try node.insertAt(node.key_count, first_key, first_value);
+
+            // Remove from right sibling
+            right_node.removeAt(0);
+
+            // Update parent separator
+            if (right_node.getKey(0)) |new_sep| {
+                parent_node.updateKeyAt(separator_idx, new_sep) catch {};
+            }
+        } else {
+            // For internal nodes, rotate through parent
+            const parent_key = parent_node.getKey(separator_idx) orelse return;
+            const right_first_key = right_node.getKey(0) orelse return;
+            const right_first_child = right_node.getChild(0) orelse return;
+
+            // Insert parent key at end with right's first child
+            try node.insertKeyChild(node.key_count, parent_key, right_first_child);
+
+            // Move right's first key to parent
+            parent_node.updateKeyAt(separator_idx, right_first_key) catch {};
+
+            // Remove first key from right and shift children
+            right_node.removeKeyAt(0);
+            right_node.shiftChildrenLeft();
+        }
+    }
+
+    /// Merge this node with left sibling
+    fn mergeWithLeft(
+        self: *BTree,
+        page_id: PageId,
+        left_id: PageId,
+        parent_id: PageId,
+        separator_idx: usize,
+        is_leaf: bool,
+    ) !void {
+        const frame = try self.buffer_pool.fetchPage(page_id);
+        var node = try BTreeNode.load(self.allocator, frame.buffer);
+
+        const left_frame = try self.buffer_pool.fetchPage(left_id);
+        var left_node = try BTreeNode.load(self.allocator, left_frame.buffer);
+
+        const parent_frame = try self.buffer_pool.fetchPage(parent_id);
+        var parent_node = try BTreeNode.load(self.allocator, parent_frame.buffer);
+
+        if (is_leaf) {
+            // Move all keys from this node to left sibling
+            for (0..node.key_count) |i| {
+                const k = node.getKey(i) orelse continue;
+                const v = node.getValue(i) orelse continue;
+                left_node.insertAt(left_node.key_count, k, v) catch continue;
+            }
+
+            // Update right sibling pointer
+            left_node.right_sibling = node.right_sibling;
+            left_node.writeHeader();
+        } else {
+            // For internal nodes, bring down separator and merge
+            const sep_key = parent_node.getKey(separator_idx) orelse {
+                self.buffer_pool.unpinPage(page_id, false);
+                self.buffer_pool.unpinPage(left_id, true);
+                self.buffer_pool.unpinPage(parent_id, false);
+                return;
+            };
+
+            // Add separator key with first child of this node
+            if (node.getChild(0)) |first_child| {
+                left_node.insertKeyChild(left_node.key_count, sep_key, first_child) catch {};
+            }
+
+            // Copy remaining keys and children
+            for (0..node.key_count) |i| {
+                const k = node.getKey(i) orelse continue;
+                const c = node.getChild(i + 1) orelse continue;
+                left_node.insertKeyChild(left_node.key_count, k, c) catch continue;
+            }
+        }
+
+        // Remove separator from parent
+        parent_node.removeKeyChildAt(separator_idx);
+
+        // Mark this page as freed
+        self.freed_pages.append(self.allocator, page_id) catch {};
+
+        self.buffer_pool.unpinPage(page_id, false);
+        self.buffer_pool.unpinPage(left_id, true);
+        self.buffer_pool.unpinPage(parent_id, true);
+    }
+
+    /// Merge with right sibling (move all from right to this node)
+    fn mergeWithRight(
+        self: *BTree,
+        page_id: PageId,
+        right_id: PageId,
+        parent_id: PageId,
+        separator_idx: usize,
+        is_leaf: bool,
+    ) !void {
+        const frame = try self.buffer_pool.fetchPage(page_id);
+        var node = try BTreeNode.load(self.allocator, frame.buffer);
+
+        const right_frame = try self.buffer_pool.fetchPage(right_id);
+        var right_node = try BTreeNode.load(self.allocator, right_frame.buffer);
+
+        const parent_frame = try self.buffer_pool.fetchPage(parent_id);
+        var parent_node = try BTreeNode.load(self.allocator, parent_frame.buffer);
+
+        if (is_leaf) {
+            // Move all keys from right sibling to this node
+            for (0..right_node.key_count) |i| {
+                const k = right_node.getKey(i) orelse continue;
+                const v = right_node.getValue(i) orelse continue;
+                node.insertAt(node.key_count, k, v) catch continue;
+            }
+
+            // Update right sibling pointer
+            node.right_sibling = right_node.right_sibling;
+            node.writeHeader();
+        } else {
+            // For internal nodes, bring down separator and merge
+            const sep_key = parent_node.getKey(separator_idx) orelse {
+                self.buffer_pool.unpinPage(page_id, true);
+                self.buffer_pool.unpinPage(right_id, false);
+                self.buffer_pool.unpinPage(parent_id, false);
+                return;
+            };
+
+            // Add separator key with first child of right node
+            if (right_node.getChild(0)) |first_child| {
+                node.insertKeyChild(node.key_count, sep_key, first_child) catch {};
+            }
+
+            // Copy remaining keys and children from right
+            for (0..right_node.key_count) |i| {
+                const k = right_node.getKey(i) orelse continue;
+                const c = right_node.getChild(i + 1) orelse continue;
+                node.insertKeyChild(node.key_count, k, c) catch continue;
+            }
+        }
+
+        // Remove separator from parent
+        parent_node.removeKeyChildAt(separator_idx);
+
+        // Mark right page as freed
+        self.freed_pages.append(self.allocator, right_id) catch {};
+
+        self.buffer_pool.unpinPage(page_id, true);
+        self.buffer_pool.unpinPage(right_id, false);
+        self.buffer_pool.unpinPage(parent_id, true);
     }
 
     /// Get the root page ID

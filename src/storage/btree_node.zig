@@ -392,6 +392,62 @@ pub const BTreeNode = struct {
         self.writeHeader();
     }
 
+    /// Update key at position (allocates new space, doesn't reclaim old)
+    pub fn updateKeyAt(self: *BTreeNode, index: usize, new_key: Key) !void {
+        if (index >= self.key_count) return errors.Error.KeyNotFound;
+
+        // Check space
+        const slot_area_end = DATA_START + (self.key_count + 1) * SLOT_SIZE;
+        const available = self.free_space - slot_area_end;
+        if (new_key.len > available) return errors.Error.ValueTooLarge;
+
+        // Allocate space for new key
+        self.free_space -= @intCast(new_key.len);
+        const key_offset = self.free_space;
+        @memcpy(self.buffer[key_offset .. key_offset + new_key.len], new_key);
+
+        // Update slot
+        var slot = getSlotAt(self.buffer, DATA_START, index);
+        slot.key_offset = @intCast(key_offset);
+        slot.key_len = @intCast(new_key.len);
+        setSlotAt(self.buffer, DATA_START, index, slot);
+
+        self.writeHeader();
+    }
+
+    /// Remove key at position (internal nodes only, keeps children)
+    pub fn removeKeyAt(self: *BTreeNode, index: usize) void {
+        if (self.is_leaf or index >= self.key_count) return;
+
+        // Shift slots down
+        var i: usize = index;
+        while (i < self.key_count - 1) : (i += 1) {
+            const next_slot = getSlotAt(self.buffer, DATA_START, i + 1);
+            setSlotAt(self.buffer, DATA_START, i, next_slot);
+        }
+
+        self.key_count -= 1;
+        self.writeHeader();
+    }
+
+    /// Remove key and corresponding child at position (internal nodes)
+    /// Alias for removeKeyChild for API consistency
+    pub fn removeKeyChildAt(self: *BTreeNode, index: usize) void {
+        self.removeKeyChild(index);
+    }
+
+    /// Shift all children left by one (after removing child 0)
+    pub fn shiftChildrenLeft(self: *BTreeNode) void {
+        if (self.is_leaf) return;
+
+        var i: usize = 0;
+        while (i <= self.key_count) : (i += 1) {
+            if (self.getChild(i + 1)) |c| {
+                self.setChild(i, c);
+            }
+        }
+    }
+
     /// Check if node is at least half full
     pub fn isHalfFull(self: *const BTreeNode) bool {
         const max_keys = maxKeysPerNode(self.page_size);

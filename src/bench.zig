@@ -196,7 +196,10 @@ fn benchRangeScan(allocator: std.mem.Allocator, config: DBConfig, count: u64) !u
     defer iter.close();
 
     var scanned: u64 = 0;
-    while (iter.next()) |_| {
+    while (true) {
+        const entry = iter.next() catch break;
+        if (entry == null) break;
+        iter.freeEntry(entry.?);
         scanned += 1;
     }
 
