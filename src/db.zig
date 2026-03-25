@@ -456,3 +456,11 @@ test "Database persistence" {
         allocator.free(result.?);
     }
 }
+
+// Type aliases for root.zig compatibility
+pub const DB = Database;
+pub const DBConfig = Config;
+pub const DBTransaction = Transaction;
+pub const DBIterator = void; // TODO: implement
+pub const Snapshot = void; // TODO: implement  
+pub const DBStats = Stats;
