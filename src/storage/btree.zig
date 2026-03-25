@@ -22,11 +22,8 @@ const BufferPool = buffer_mod.BufferPool;
 const BufferFrame = buffer_mod.BufferFrame;
 const Freelist = freelist_mod.Freelist;
 
-/// Minimum fill factor for splits
-const MIN_KEYS_AFTER_SPLIT: usize = 2;
-
-/// Minimum keys before underflow (for merge/redistribute)
-const MIN_KEYS: usize = 2;
+/// Default minimum keys after split
+const DEFAULT_MIN_KEYS: usize = 2;
 
 /// B+ tree implementation
 pub const BTree = struct {
@@ -40,20 +37,42 @@ pub const BTree = struct {
     page_size: usize,
     /// Allocator
     allocator: std.mem.Allocator,
+    /// Fill factor (percentage 50-100)
+    fill_factor: u8,
+    /// Minimum keys per node (derived from fill factor)
+    min_keys: usize,
 
-    /// Initialize B+ tree
+    /// Initialize B+ tree with default fill factor (70%)
     pub fn init(
         allocator: std.mem.Allocator,
         buffer_pool: *BufferPool,
         freelist: *Freelist,
         root_page_id: PageId,
     ) BTree {
+        return initWithFillFactor(allocator, buffer_pool, freelist, root_page_id, 70);
+    }
+
+    /// Initialize B+ tree with custom fill factor
+    pub fn initWithFillFactor(
+        allocator: std.mem.Allocator,
+        buffer_pool: *BufferPool,
+        freelist: *Freelist,
+        root_page_id: PageId,
+        fill_factor: u8,
+    ) BTree {
+        // Calculate min keys from fill factor
+        // Assuming max ~100 keys per node, min_keys = max_keys * fill_factor / 200
+        const max_keys: usize = 100; // approximate
+        const min_keys = @max(2, (max_keys * fill_factor) / 200);
+
         return .{
             .buffer_pool = buffer_pool,
             .freelist = freelist,
             .root_page_id = root_page_id,
             .page_size = buffer_pool.page_size,
             .allocator = allocator,
+            .fill_factor = fill_factor,
+            .min_keys = min_keys,
         };
     }
 
@@ -403,7 +422,7 @@ pub const BTree = struct {
         self.buffer_pool.unpinPage(child_id, false);
 
         // Check if underflow
-        if (child.key_count >= MIN_KEYS) return;
+        if (child.key_count >= self.min_keys) return;
 
         // Try to borrow from left sibling
         if (child_idx > 0) {
@@ -412,7 +431,7 @@ pub const BTree = struct {
             const left = try BTreeNode.load(self.allocator, left_frame.buffer);
             self.buffer_pool.unpinPage(left_id, false);
 
-            if (left.key_count > MIN_KEYS) {
+            if (left.key_count > self.min_keys) {
                 // Can borrow from left - redistribute
                 // For simplicity, we skip actual redistribution in v0.1
                 // The tree may become slightly unbalanced but remains correct
@@ -427,7 +446,7 @@ pub const BTree = struct {
             const right = try BTreeNode.load(self.allocator, right_frame.buffer);
             self.buffer_pool.unpinPage(right_id, false);
 
-            if (right.key_count > MIN_KEYS) {
+            if (right.key_count > self.min_keys) {
                 // Can borrow from right - redistribute
                 // For simplicity, we skip actual redistribution in v0.1
                 return;

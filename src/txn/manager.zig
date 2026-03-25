@@ -35,6 +35,8 @@ pub const Transaction = struct {
     last_lsn: LSN,
     /// Transaction manager reference
     manager: *TransactionManager,
+    /// Database pointer (opaque to avoid circular import)
+    db_ptr: ?*anyopaque,
 
     /// Check if transaction is active
     pub fn isActive(self: *const Transaction) bool {
@@ -114,14 +116,14 @@ pub const Transaction = struct {
         }
 
         if (self.manager.wal) |wal| {
-            const delete = DeleteData{
+            const del_data = DeleteData{
                 .page_id = page_id,
                 .key = key,
             };
 
-            const data = try self.manager.allocator.alloc(u8, delete.serializedSize());
+            const data = try self.manager.allocator.alloc(u8, del_data.serializedSize());
             defer self.manager.allocator.free(data);
-            delete.serialize(data);
+            del_data.serialize(data);
 
             self.last_lsn = try wal.append(self.id, self.last_lsn, .delete, data);
             return self.last_lsn;
@@ -133,6 +135,35 @@ pub const Transaction = struct {
     /// Get transaction ID
     pub fn getId(self: *const Transaction) TransactionId {
         return self.id;
+    }
+
+    /// Put a key-value pair within this transaction
+    pub fn put(self: *Transaction, key: Key, value: Value) !void {
+        if (self.state != .active) return errors.Error.TransactionInactive;
+        if (self.read_only) return errors.Error.ReadOnlyTransaction;
+
+        const db = @import("../db.zig");
+        const database: *db.Database = @ptrCast(@alignCast(self.db_ptr orelse return errors.Error.TransactionInactive));
+        try database.putTxn(self, key, value);
+    }
+
+    /// Get a value within this transaction
+    pub fn get(self: *Transaction, key: Key) !?Value {
+        if (self.state != .active) return errors.Error.TransactionInactive;
+
+        const db = @import("../db.zig");
+        const database: *db.Database = @ptrCast(@alignCast(self.db_ptr orelse return errors.Error.TransactionInactive));
+        return database.getTxn(self, key);
+    }
+
+    /// Delete a key within this transaction
+    pub fn delete(self: *Transaction, key: Key) !void {
+        if (self.state != .active) return errors.Error.TransactionInactive;
+        if (self.read_only) return errors.Error.ReadOnlyTransaction;
+
+        const db = @import("../db.zig");
+        const database: *db.Database = @ptrCast(@alignCast(self.db_ptr orelse return errors.Error.TransactionInactive));
+        try database.deleteTxn(self, key);
     }
 };
 
@@ -154,6 +185,8 @@ pub const TransactionManager = struct {
     default_isolation: IsolationLevel,
     /// Mutex for thread safety
     mutex: std.Thread.Mutex,
+    /// Database pointer (opaque to avoid circular import)
+    db_ptr: ?*anyopaque,
 
     /// Initialize transaction manager
     pub fn init(allocator: std.mem.Allocator, wal: ?*WALWriter, default_isolation: IsolationLevel) TransactionManager {
@@ -166,7 +199,13 @@ pub const TransactionManager = struct {
             .current_ts = 1,
             .default_isolation = default_isolation,
             .mutex = .{},
+            .db_ptr = null,
         };
+    }
+
+    /// Set database pointer (called after Database is fully initialized)
+    pub fn setDatabase(self: *TransactionManager, db: *anyopaque) void {
+        self.db_ptr = db;
     }
 
     /// Free resources
@@ -209,6 +248,7 @@ pub const TransactionManager = struct {
             .start_ts = ts,
             .last_lsn = INVALID_LSN,
             .manager = self,
+            .db_ptr = self.db_ptr,
         };
 
         // Track for cleanup

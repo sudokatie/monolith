@@ -22,6 +22,10 @@ pub const BufferFrame = struct {
     dirty: bool,
     /// Usage count for LRU-K approximation (clock algorithm)
     reference_bit: bool,
+    /// Page-level latch for concurrent access
+    latch: std.Thread.RwLock,
+    /// Whether latch is held in exclusive mode
+    latch_exclusive: bool,
 };
 
 /// Buffer pool manager
@@ -56,6 +60,8 @@ pub const BufferPool = struct {
             frame.pin_count = 0;
             frame.dirty = false;
             frame.reference_bit = false;
+            frame.latch = .{};
+            frame.latch_exclusive = false;
         }
 
         return .{
@@ -160,6 +166,35 @@ pub const BufferPool = struct {
     pub fn markDirty(self: *BufferPool, page_id: PageId) void {
         if (self.page_table.get(page_id)) |frame_idx| {
             self.frames[frame_idx].dirty = true;
+        }
+    }
+
+    /// Acquire shared (read) latch on a page
+    pub fn latchShared(self: *BufferPool, page_id: PageId) void {
+        if (self.page_table.get(page_id)) |frame_idx| {
+            self.frames[frame_idx].latch.lockShared();
+        }
+    }
+
+    /// Acquire exclusive (write) latch on a page
+    pub fn latchExclusive(self: *BufferPool, page_id: PageId) void {
+        if (self.page_table.get(page_id)) |frame_idx| {
+            const frame = &self.frames[frame_idx];
+            frame.latch.lock();
+            frame.latch_exclusive = true;
+        }
+    }
+
+    /// Release latch on a page
+    pub fn unlatch(self: *BufferPool, page_id: PageId) void {
+        if (self.page_table.get(page_id)) |frame_idx| {
+            const frame = &self.frames[frame_idx];
+            if (frame.latch_exclusive) {
+                frame.latch.unlock();
+                frame.latch_exclusive = false;
+            } else {
+                frame.latch.unlockShared();
+            }
         }
     }
 

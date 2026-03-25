@@ -103,6 +103,8 @@ pub const Config = struct {
     wal_segment_size: usize = 16 * 1024 * 1024, // 16MB default
     /// Checkpoint interval in number of transactions
     checkpoint_interval: u32 = 1000,
+    /// B+ tree fill factor (percentage, 50-100)
+    fill_factor: u8 = 70,
 };
 
 /// Comparison result for keys

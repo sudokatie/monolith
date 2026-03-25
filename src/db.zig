@@ -6,6 +6,7 @@ const meta_mod = @import("storage/meta.zig");
 const freelist_mod = @import("storage/freelist.zig");
 const buffer_mod = @import("storage/buffer.zig");
 const btree_mod = @import("storage/btree.zig");
+const overflow_mod = @import("storage/overflow.zig");
 const wal_writer = @import("wal/writer.zig");
 const wal_record = @import("wal/record.zig");
 const wal_recovery = @import("wal/recovery.zig");
@@ -37,6 +38,10 @@ const TransactionManager = txn_manager.TransactionManager;
 const Transaction = txn_manager.Transaction;
 const LockManager = lock_mod.LockManager;
 const LockMode = lock_mod.LockMode;
+const OverflowManager = overflow_mod.OverflowManager;
+
+/// Overflow threshold - values larger than this use overflow pages
+const OVERFLOW_THRESHOLD: usize = 1024; // 1KB
 
 /// Database handle
 pub const Database = struct {
@@ -60,6 +65,8 @@ pub const Database = struct {
     lock_manager: LockManager,
     /// Checkpoint manager
     checkpoint: Checkpoint,
+    /// Overflow page manager
+    overflow_manager: OverflowManager,
     /// Database path
     path: []const u8,
     /// Configuration
@@ -99,6 +106,7 @@ pub const Database = struct {
             .txn_manager = undefined,
             .lock_manager = undefined,
             .checkpoint = undefined,
+            .overflow_manager = undefined,
             .path = path_copy,
             .config = config,
             .is_open = true,
@@ -108,10 +116,14 @@ pub const Database = struct {
         db.meta = try MetaManager.init(allocator, &db.file);
         db.buffer_pool = try BufferPool.init(allocator, &db.file, pool_size);
         db.freelist = try Freelist.init(allocator, &db.file, db.meta.getMeta().freelist_page_id);
-        db.btree = BTree.init(allocator, &db.buffer_pool, &db.freelist, db.meta.getMeta().root_page_id);
+        db.btree = BTree.initWithFillFactor(allocator, &db.buffer_pool, &db.freelist, db.meta.getMeta().root_page_id, config.fill_factor);
         db.txn_manager = TransactionManager.init(allocator, &db.wal, config.isolation_level);
         db.lock_manager = LockManager.init(allocator, 1000);
         db.checkpoint = Checkpoint.init(allocator, &db.wal, &db.buffer_pool, config.checkpoint_interval);
+        db.overflow_manager = OverflowManager.init(allocator, &db.buffer_pool, &db.file);
+
+        // Set database pointer for transactions
+        db.txn_manager.setDatabase(db);
 
         // Perform recovery if needed
         try db.recover();
@@ -142,6 +154,7 @@ pub const Database = struct {
 
         // Close components
         self.wal.close();
+        self.overflow_manager.deinit();
         self.lock_manager.deinit();
         self.txn_manager.deinit();
         self.freelist.deinit();
@@ -197,7 +210,18 @@ pub const Database = struct {
     pub fn getTxn(self: *Database, txn: *Transaction, key: Key) !?Value {
         // Acquire shared lock
         try self.lock_manager.acquire(txn.id, key, .shared);
-        return self.btree.search(key);
+
+        const result = try self.btree.search(key);
+        if (result) |val| {
+            // Check if this is an overflow pointer
+            if (val.len == 9 and val[0] == 0xFF) {
+                const overflow_page_id = std.mem.bytesToValue(PageId, val[1..9]);
+                self.allocator.free(val); // Free the pointer buffer
+                return try self.overflow_manager.readValue(overflow_page_id);
+            }
+            return val;
+        }
+        return null;
     }
 
     /// Put with transaction
@@ -208,8 +232,20 @@ pub const Database = struct {
         // Log the operation
         _ = try txn.logInsert(self.btree.getRootPageId(), key, value);
 
-        // Perform the insert
-        try self.btree.insert(key, value);
+        // Check if value needs overflow pages
+        if (value.len > OVERFLOW_THRESHOLD) {
+            // Store in overflow pages
+            const overflow_page_id = try self.overflow_manager.storeValue(value);
+
+            // Store overflow pointer in btree (8 bytes for page ID)
+            var pointer_buf: [9]u8 = undefined;
+            pointer_buf[0] = 0xFF; // Marker for overflow pointer
+            @memcpy(pointer_buf[1..9], std.mem.asBytes(&overflow_page_id));
+            try self.btree.insert(key, &pointer_buf);
+        } else {
+            // Perform normal insert
+            try self.btree.insert(key, value);
+        }
     }
 
     /// Delete with transaction
@@ -489,6 +525,44 @@ test "Database persistence" {
         try std.testing.expectEqualStrings("persist_value", result.?);
         allocator.free(result.?);
     }
+}
+
+test "Transaction put/get/delete API" {
+    const allocator = std.testing.allocator;
+    const path = "test_txn_api.db";
+
+    std.fs.cwd().deleteFile(path) catch {};
+    std.fs.cwd().deleteFile("test_txn_api.db.wal") catch {};
+    defer {
+        std.fs.cwd().deleteFile(path) catch {};
+        std.fs.cwd().deleteFile("test_txn_api.db.wal") catch {};
+    }
+
+    const db = try Database.open(allocator, path, Config{});
+    defer db.close();
+
+    // Test txn.put and txn.get
+    var txn = try db.begin();
+    try txn.put("txn_key1", "txn_value1");
+    try txn.put("txn_key2", "txn_value2");
+
+    const val = try txn.get("txn_key1");
+    try std.testing.expect(val != null);
+    try std.testing.expectEqualStrings("txn_value1", val.?);
+    allocator.free(val.?);
+
+    // Test txn.delete
+    try txn.delete("txn_key2");
+    const deleted = try txn.get("txn_key2");
+    try std.testing.expect(deleted == null);
+
+    try txn.commit();
+
+    // Verify committed data
+    const after = try db.get("txn_key1");
+    try std.testing.expect(after != null);
+    try std.testing.expectEqualStrings("txn_value1", after.?);
+    allocator.free(after.?);
 }
 
 // Type aliases for root.zig compatibility

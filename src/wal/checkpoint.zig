@@ -100,6 +100,18 @@ pub const Checkpoint = struct {
         return self.last_checkpoint_lsn;
     }
 
+    /// Perform checkpoint and truncate WAL
+    /// This removes log records before the checkpoint that are no longer needed
+    pub fn checkpointAndTruncate(self: *Checkpoint, active_txns: []const TransactionId, dirty_pages: []const PageId) !void {
+        try self.performCheckpoint(active_txns, dirty_pages);
+
+        // Truncate WAL after checkpoint - we can discard records before checkpoint
+        // since all dirty pages have been flushed
+        // Note: In a production system, you'd want to keep some records for
+        // point-in-time recovery, but for basic crash recovery, truncation is safe
+        try self.wal.truncate(self.wal.position);
+    }
+
     /// Check if checkpoint is needed
     pub fn needsCheckpoint(self: *const Checkpoint) bool {
         return self.txn_count >= self.interval;
