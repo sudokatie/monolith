@@ -13,6 +13,7 @@ const wal_recovery = @import("wal/recovery.zig");
 const wal_checkpoint = @import("wal/checkpoint.zig");
 const txn_manager = @import("txn/manager.zig");
 const lock_mod = @import("txn/lock.zig");
+const mvcc_mod = @import("txn/mvcc.zig");
 
 const PageId = types.PageId;
 const TransactionId = types.TransactionId;
@@ -39,6 +40,7 @@ const Transaction = txn_manager.Transaction;
 const LockManager = lock_mod.LockManager;
 const LockMode = lock_mod.LockMode;
 const OverflowManager = overflow_mod.OverflowManager;
+const MVCCStore = mvcc_mod.MVCCStore;
 
 /// Overflow threshold - values larger than this use overflow pages
 const OVERFLOW_THRESHOLD: usize = 1024; // 1KB
@@ -67,6 +69,8 @@ pub const Database = struct {
     checkpoint: Checkpoint,
     /// Overflow page manager
     overflow_manager: OverflowManager,
+    /// MVCC store for version visibility
+    mvcc_store: MVCCStore,
     /// Database path
     path: []const u8,
     /// Configuration
@@ -107,6 +111,7 @@ pub const Database = struct {
             .lock_manager = undefined,
             .checkpoint = undefined,
             .overflow_manager = undefined,
+            .mvcc_store = undefined,
             .path = path_copy,
             .config = config,
             .is_open = true,
@@ -121,6 +126,7 @@ pub const Database = struct {
         db.lock_manager = LockManager.init(allocator, 1000);
         db.checkpoint = Checkpoint.init(allocator, &db.wal, &db.buffer_pool, config.checkpoint_interval);
         db.overflow_manager = OverflowManager.init(allocator, &db.buffer_pool, &db.file);
+        db.mvcc_store = MVCCStore.init(allocator);
 
         // Set database pointer for transactions
         db.txn_manager.setDatabase(db);
@@ -154,6 +160,7 @@ pub const Database = struct {
 
         // Close components
         self.wal.close();
+        self.mvcc_store.deinit();
         self.overflow_manager.deinit();
         self.lock_manager.deinit();
         self.txn_manager.deinit();
@@ -211,6 +218,15 @@ pub const Database = struct {
         // Acquire shared lock
         try self.lock_manager.acquire(txn.id, key, .shared);
 
+        // Check MVCC store first for uncommitted writes visible to this txn
+        if (self.mvcc_store.get(key, txn.start_ts)) |mvcc_val| {
+            // Copy the value since MVCC store owns it
+            const copy = try self.allocator.alloc(u8, mvcc_val.len);
+            @memcpy(copy, mvcc_val);
+            return copy;
+        }
+
+        // Fall back to btree for committed data
         const result = try self.btree.search(key);
         if (result) |val| {
             // Check if this is an overflow pointer
@@ -232,6 +248,9 @@ pub const Database = struct {
         // Log the operation
         _ = try txn.logInsert(self.btree.getRootPageId(), key, value);
 
+        // Write to MVCC store for visibility tracking
+        _ = try self.mvcc_store.put(txn.id, key, value);
+
         // Check if value needs overflow pages
         if (value.len > OVERFLOW_THRESHOLD) {
             // Store in overflow pages
@@ -243,7 +262,7 @@ pub const Database = struct {
             @memcpy(pointer_buf[1..9], std.mem.asBytes(&overflow_page_id));
             try self.btree.insert(key, &pointer_buf);
         } else {
-            // Perform normal insert
+            // Perform normal insert to btree for persistence
             try self.btree.insert(key, value);
         }
     }
@@ -256,7 +275,10 @@ pub const Database = struct {
         // Log the operation
         _ = try txn.logDelete(self.btree.getRootPageId(), key);
 
-        // Perform the delete
+        // Mark deleted in MVCC store
+        _ = try self.mvcc_store.delete(txn.id, key);
+
+        // Perform the delete in btree
         try self.btree.delete(key);
     }
 
