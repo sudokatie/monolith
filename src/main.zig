@@ -1,12 +1,5 @@
 const std = @import("std");
 
-pub fn main() !void {
-    // Monolith is a library - use as a dependency
-    // See README.md for usage examples
-    const msg = "monolith: This is a library. Import it in your project.\nSee README.md for usage examples.\n";
-    _ = try std.posix.write(2, msg);
-}
-
 // Core types and errors
 pub const types = @import("core/types.zig");
 pub const errors = @import("core/errors.zig");
@@ -33,6 +26,7 @@ pub const txn_lock = @import("txn/lock.zig");
 
 // Database API
 pub const db = @import("db.zig");
+pub const bench = @import("bench.zig");
 
 // Re-export commonly used types
 pub const PageId = types.PageId;
@@ -47,6 +41,12 @@ pub const Key = types.Key;
 pub const Value = types.Value;
 pub const KeyValue = types.KeyValue;
 pub const Ordering = types.Ordering;
+
+// Re-export main types
+pub const Database = db.Database;
+pub const Transaction = txn_manager.Transaction;
+pub const BTree = btree.BTree;
+pub const BufferPool = buffer.BufferPool;
 
 // Re-export errors
 pub const Error = errors.Error;
@@ -67,6 +67,11 @@ pub const formatError = errors.formatError;
 test {
     // Run all tests in submodules
     std.testing.refAllDecls(@This());
+}
+
+pub fn main() !void {
+    std.debug.print("Monolith KV Store v0.1.0\n", .{});
+    std.debug.print("Use as a library: @import(\"monolith\")\n", .{});
 }
 
 test "library exports" {

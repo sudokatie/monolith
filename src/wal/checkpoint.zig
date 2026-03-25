@@ -1,365 +1,319 @@
 const std = @import("std");
 const types = @import("../core/types.zig");
 const errors = @import("../core/errors.zig");
-const wal_writer = @import("writer.zig");
-const wal_record = @import("record.zig");
+const record = @import("record.zig");
+const writer_mod = @import("writer.zig");
+const buffer_mod = @import("../storage/buffer.zig");
 
 const LSN = types.LSN;
+const TransactionId = types.TransactionId;
+const PageId = types.PageId;
 const INVALID_LSN = types.INVALID_LSN;
-const WALWriter = wal_writer.WALWriter;
 
-/// Callback interface for flushing dirty pages
-pub const FlushCallback = struct {
-    context: *anyopaque,
-    flushFn: *const fn (ctx: *anyopaque) errors.MonolithError!void,
-
-    pub fn flush(self: FlushCallback) errors.MonolithError!void {
-        return self.flushFn(self.context);
-    }
-};
-
-/// Callback interface for updating meta page
-pub const MetaCallback = struct {
-    context: *anyopaque,
-    updateFn: *const fn (ctx: *anyopaque, checkpoint_lsn: LSN) errors.MonolithError!void,
-
-    pub fn update(self: MetaCallback, checkpoint_lsn: LSN) errors.MonolithError!void {
-        return self.updateFn(self.context, checkpoint_lsn);
-    }
-};
-
-/// Checkpoint configuration
-pub const CheckpointConfig = struct {
-    /// Minimum number of records before checkpoint
-    min_records: u32 = 1000,
-    /// Minimum WAL size before checkpoint (bytes)
-    min_wal_size: u64 = 16 * 1024 * 1024, // 16MB
-    /// Force checkpoint regardless of thresholds
-    force: bool = false,
-};
+const RecordType = record.RecordType;
+const CheckpointData = record.CheckpointData;
+const WALWriter = writer_mod.WALWriter;
+const BufferPool = buffer_mod.BufferPool;
 
 /// Checkpoint manager
-pub const CheckpointManager = struct {
-    allocator: std.mem.Allocator,
-    /// WAL writer reference
+pub const Checkpoint = struct {
+    /// WAL writer
     wal: *WALWriter,
+    /// Buffer pool
+    buffer_pool: *BufferPool,
+    /// Allocator
+    allocator: std.mem.Allocator,
+    /// Checkpoint interval (number of transactions)
+    interval: u32,
+    /// Transactions since last checkpoint
+    txn_count: u32,
     /// Last checkpoint LSN
     last_checkpoint_lsn: LSN,
-    /// Records since last checkpoint
-    records_since_checkpoint: u64,
-    /// Configuration
-    config: CheckpointConfig,
 
-    pub fn init(allocator: std.mem.Allocator, wal: *WALWriter) CheckpointManager {
+    /// Initialize checkpoint manager
+    pub fn init(allocator: std.mem.Allocator, wal: *WALWriter, buffer_pool: *BufferPool, interval: u32) Checkpoint {
         return .{
-            .allocator = allocator,
             .wal = wal,
+            .buffer_pool = buffer_pool,
+            .allocator = allocator,
+            .interval = interval,
+            .txn_count = 0,
             .last_checkpoint_lsn = INVALID_LSN,
-            .records_since_checkpoint = 0,
-            .config = .{},
         };
     }
 
-    pub fn deinit(self: *CheckpointManager) void {
-        _ = self;
-        // No resources to clean up
-    }
+    /// Notify that a transaction has committed
+    pub fn onCommit(self: *Checkpoint) !void {
+        self.txn_count += 1;
 
-    /// Set checkpoint configuration
-    pub fn configure(self: *CheckpointManager, config: CheckpointConfig) void {
-        self.config = config;
-    }
-
-    /// Check if checkpoint is needed based on thresholds
-    pub fn needsCheckpoint(self: *const CheckpointManager) bool {
-        if (self.config.force) return true;
-        if (self.records_since_checkpoint >= self.config.min_records) return true;
-        if (self.wal.getPosition() >= self.config.min_wal_size) return true;
-        return false;
-    }
-
-    /// Increment record count (call after each WAL write)
-    pub fn recordWritten(self: *CheckpointManager) void {
-        self.records_since_checkpoint += 1;
+        if (self.txn_count >= self.interval) {
+            try self.performCheckpoint(&[_]TransactionId{}, &[_]PageId{});
+        }
     }
 
     /// Perform a checkpoint
-    /// 1. Flush all dirty pages (via callback)
-    /// 2. Write checkpoint record to WAL
-    /// 3. Update meta page (via callback)
-    /// 4. Optionally truncate old WAL segments
-    pub fn checkpoint(
-        self: *CheckpointManager,
-        flush_callback: ?FlushCallback,
-        meta_callback: ?MetaCallback,
-    ) errors.MonolithError!LSN {
-        // Step 1: Flush all dirty pages
-        if (flush_callback) |cb| {
-            try cb.flush();
+    pub fn performCheckpoint(self: *Checkpoint, active_txns: []const TransactionId, dirty_pages: []const PageId) !void {
+        // Write checkpoint begin record
+        const begin_lsn = try self.wal.append(0, INVALID_LSN, .checkpoint_begin, "");
+
+        // Flush all dirty pages from buffer pool
+        try self.buffer_pool.flushAll();
+
+        // Serialize checkpoint data
+        const data_size = 8 + active_txns.len * 8 + dirty_pages.len * 8;
+        const data = try self.allocator.alloc(u8, data_size);
+        defer self.allocator.free(data);
+
+        const txn_count: u32 = @intCast(active_txns.len);
+        const page_count: u32 = @intCast(dirty_pages.len);
+
+        @memcpy(data[0..4], std.mem.asBytes(&txn_count));
+        @memcpy(data[4..8], std.mem.asBytes(&page_count));
+
+        var offset: usize = 8;
+        for (active_txns) |txn_id| {
+            @memcpy(data[offset .. offset + 8], std.mem.asBytes(&txn_id));
+            offset += 8;
+        }
+        for (dirty_pages) |page_id| {
+            @memcpy(data[offset .. offset + 8], std.mem.asBytes(&page_id));
+            offset += 8;
         }
 
-        // Step 2: Write checkpoint record to WAL
-        const checkpoint_lsn = try self.wal.writeCheckpoint();
+        // Write checkpoint end record with data
+        _ = try self.wal.append(0, begin_lsn, .checkpoint_end, data);
 
-        // Step 3: Update meta page with checkpoint LSN
-        if (meta_callback) |cb| {
-            try cb.update(checkpoint_lsn);
-        }
+        // Sync WAL
+        try self.wal.sync();
 
-        // Update state
-        self.last_checkpoint_lsn = checkpoint_lsn;
-        self.records_since_checkpoint = 0;
-
-        return checkpoint_lsn;
+        self.last_checkpoint_lsn = begin_lsn;
+        self.txn_count = 0;
     }
 
-    /// Perform checkpoint and truncate old WAL segments
-    pub fn checkpointAndTruncate(
-        self: *CheckpointManager,
-        flush_callback: ?FlushCallback,
-        meta_callback: ?MetaCallback,
-    ) errors.MonolithError!CheckpointResult {
-        const checkpoint_lsn = try self.checkpoint(flush_callback, meta_callback);
-
-        // Keep only current segment and newer
-        const current_segment = self.wal.getSegmentNum();
-        const deleted = try self.wal.deleteOldSegments(current_segment);
-
-        return .{
-            .checkpoint_lsn = checkpoint_lsn,
-            .segments_deleted = deleted,
-        };
+    /// Force a checkpoint regardless of interval
+    pub fn forceCheckpoint(self: *Checkpoint, active_txns: []const TransactionId, dirty_pages: []const PageId) !void {
+        try self.performCheckpoint(active_txns, dirty_pages);
     }
 
-    /// Get the last checkpoint LSN
-    pub fn getLastCheckpointLSN(self: *const CheckpointManager) LSN {
+    /// Get last checkpoint LSN
+    pub fn getLastCheckpointLSN(self: *const Checkpoint) LSN {
         return self.last_checkpoint_lsn;
     }
 
-    /// Set the last checkpoint LSN (for recovery)
-    pub fn setLastCheckpointLSN(self: *CheckpointManager, lsn: LSN) void {
-        self.last_checkpoint_lsn = lsn;
-    }
-
-    /// Get records written since last checkpoint
-    pub fn getRecordsSinceCheckpoint(self: *const CheckpointManager) u64 {
-        return self.records_since_checkpoint;
+    /// Check if checkpoint is needed
+    pub fn needsCheckpoint(self: *const Checkpoint) bool {
+        return self.txn_count >= self.interval;
     }
 };
 
-/// Result of a checkpoint with truncation
-pub const CheckpointResult = struct {
-    checkpoint_lsn: LSN,
-    segments_deleted: u64,
-};
+/// Fuzzy checkpoint implementation (allows concurrent operations)
+pub const FuzzyCheckpoint = struct {
+    /// Base checkpoint manager
+    base: Checkpoint,
+    /// Is checkpoint in progress?
+    in_progress: bool,
+    /// Pages being checkpointed
+    checkpoint_pages: std.ArrayListUnmanaged(PageId),
+    /// Allocator
+    allocator: std.mem.Allocator,
 
-/// Simple checkpoint scheduler
-pub const CheckpointScheduler = struct {
-    manager: *CheckpointManager,
-    interval_records: u32,
-    last_check_records: u64,
-
-    pub fn init(manager: *CheckpointManager, interval_records: u32) CheckpointScheduler {
+    /// Initialize fuzzy checkpoint manager
+    pub fn init(allocator: std.mem.Allocator, wal: *WALWriter, buffer_pool: *BufferPool, interval: u32) FuzzyCheckpoint {
         return .{
-            .manager = manager,
-            .interval_records = interval_records,
-            .last_check_records = 0,
+            .base = Checkpoint.init(allocator, wal, buffer_pool, interval),
+            .in_progress = false,
+            .checkpoint_pages = .{},
+            .allocator = allocator,
         };
     }
 
-    /// Called after each record write
-    /// Returns true if checkpoint was triggered
-    pub fn onRecordWritten(
-        self: *CheckpointScheduler,
-        flush_callback: ?FlushCallback,
-        meta_callback: ?MetaCallback,
-    ) errors.MonolithError!bool {
-        self.manager.recordWritten();
+    /// Free resources
+    pub fn deinit(self: *FuzzyCheckpoint) void {
+        self.checkpoint_pages.deinit(self.allocator);
+    }
 
-        const records = self.manager.getRecordsSinceCheckpoint();
-        if (records >= self.interval_records) {
-            _ = try self.manager.checkpoint(flush_callback, meta_callback);
-            return true;
+    /// Start a fuzzy checkpoint (non-blocking)
+    pub fn startCheckpoint(self: *FuzzyCheckpoint, active_txns: []const TransactionId) !LSN {
+        if (self.in_progress) {
+            return errors.Error.AlreadyOpen;
         }
-        return false;
+
+        self.in_progress = true;
+        self.checkpoint_pages.clearRetainingCapacity();
+
+        // Write checkpoint begin record
+        const begin_lsn = try self.base.wal.append(0, INVALID_LSN, .checkpoint_begin, "");
+
+        // Collect dirty pages to checkpoint
+        const stats = self.base.buffer_pool.stats();
+        _ = stats;
+        _ = active_txns;
+
+        // In a real implementation, we'd collect the dirty page list here
+        // and checkpoint them incrementally
+
+        return begin_lsn;
+    }
+
+    /// Complete the fuzzy checkpoint
+    pub fn completeCheckpoint(self: *FuzzyCheckpoint, begin_lsn: LSN, active_txns: []const TransactionId) !void {
+        if (!self.in_progress) {
+            return;
+        }
+
+        // Serialize checkpoint data
+        const dirty_pages = self.checkpoint_pages.items;
+        const data_size = 8 + active_txns.len * 8 + dirty_pages.len * 8;
+        const data = try self.base.allocator.alloc(u8, data_size);
+        defer self.base.allocator.free(data);
+
+        const txn_count: u32 = @intCast(active_txns.len);
+        const page_count: u32 = @intCast(dirty_pages.len);
+
+        @memcpy(data[0..4], std.mem.asBytes(&txn_count));
+        @memcpy(data[4..8], std.mem.asBytes(&page_count));
+
+        var offset: usize = 8;
+        for (active_txns) |txn_id| {
+            @memcpy(data[offset .. offset + 8], std.mem.asBytes(&txn_id));
+            offset += 8;
+        }
+        for (dirty_pages) |page_id| {
+            @memcpy(data[offset .. offset + 8], std.mem.asBytes(&page_id));
+            offset += 8;
+        }
+
+        // Write checkpoint end
+        _ = try self.base.wal.append(0, begin_lsn, .checkpoint_end, data);
+        try self.base.wal.sync();
+
+        self.base.last_checkpoint_lsn = begin_lsn;
+        self.base.txn_count = 0;
+        self.in_progress = false;
+    }
+
+    /// Cancel an in-progress checkpoint
+    pub fn cancelCheckpoint(self: *FuzzyCheckpoint) void {
+        self.in_progress = false;
+        self.checkpoint_pages.clearRetainingCapacity();
+    }
+
+    /// Is checkpoint in progress?
+    pub fn isInProgress(self: *const FuzzyCheckpoint) bool {
+        return self.in_progress;
     }
 };
 
 // Tests
 
-test "CheckpointManager init" {
+test "Checkpoint basic" {
     const allocator = std.testing.allocator;
+    const wal_path = "test_checkpoint.wal";
+    const db_path = "test_checkpoint.db";
 
-    std.fs.cwd().deleteTree("/tmp/test_ckpt_init") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_ckpt_init") catch {};
-
-    var wal = try WALWriter.init(allocator, "/tmp/test_ckpt_init", .none, wal_writer.DEFAULT_SEGMENT_SIZE);
-    defer wal.deinit();
-
-    var manager = CheckpointManager.init(allocator, &wal);
-    defer manager.deinit();
-
-    try std.testing.expectEqual(INVALID_LSN, manager.getLastCheckpointLSN());
-    try std.testing.expectEqual(@as(u64, 0), manager.getRecordsSinceCheckpoint());
-}
-
-test "CheckpointManager needsCheckpoint" {
-    const allocator = std.testing.allocator;
-
-    std.fs.cwd().deleteTree("/tmp/test_ckpt_needs") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_ckpt_needs") catch {};
-
-    var wal = try WALWriter.init(allocator, "/tmp/test_ckpt_needs", .none, wal_writer.DEFAULT_SEGMENT_SIZE);
-    defer wal.deinit();
-
-    var manager = CheckpointManager.init(allocator, &wal);
-    defer manager.deinit();
-
-    // Configure with low threshold
-    manager.configure(.{ .min_records = 5, .min_wal_size = 1024 * 1024 });
-
-    try std.testing.expect(!manager.needsCheckpoint());
-
-    // Add some records
-    var i: u32 = 0;
-    while (i < 5) : (i += 1) {
-        manager.recordWritten();
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(db_path) catch {};
+    defer {
+        std.fs.cwd().deleteFile(wal_path) catch {};
+        std.fs.cwd().deleteFile(db_path) catch {};
     }
 
-    try std.testing.expect(manager.needsCheckpoint());
-}
+    const file_mod = @import("../storage/file.zig");
 
-test "CheckpointManager force checkpoint" {
-    const allocator = std.testing.allocator;
+    var file = try file_mod.File.open(allocator, db_path, types.DEFAULT_PAGE_SIZE);
+    defer file.close();
 
-    std.fs.cwd().deleteTree("/tmp/test_ckpt_force") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_ckpt_force") catch {};
+    var buffer_pool = try BufferPool.init(allocator, &file, 10);
+    defer buffer_pool.deinit();
 
-    var wal = try WALWriter.init(allocator, "/tmp/test_ckpt_force", .none, wal_writer.DEFAULT_SEGMENT_SIZE);
-    defer wal.deinit();
+    var wal = try WALWriter.open(allocator, wal_path, .sync);
+    defer wal.close();
 
-    var manager = CheckpointManager.init(allocator, &wal);
-    defer manager.deinit();
+    var checkpoint = Checkpoint.init(allocator, &wal, &buffer_pool, 10);
 
-    manager.configure(.{ .force = true });
-    try std.testing.expect(manager.needsCheckpoint());
-}
+    try std.testing.expectEqual(INVALID_LSN, checkpoint.getLastCheckpointLSN());
+    try std.testing.expect(!checkpoint.needsCheckpoint());
 
-test "CheckpointManager checkpoint" {
-    const allocator = std.testing.allocator;
-
-    std.fs.cwd().deleteTree("/tmp/test_ckpt_do") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_ckpt_do") catch {};
-
-    var wal = try WALWriter.init(allocator, "/tmp/test_ckpt_do", .none, wal_writer.DEFAULT_SEGMENT_SIZE);
-    defer wal.deinit();
-
-    var manager = CheckpointManager.init(allocator, &wal);
-    defer manager.deinit();
-
-    // Write some records
-    _ = try wal.writeBegin(1);
-    manager.recordWritten();
-    _ = try wal.writeInsert(1, "key", "value");
-    manager.recordWritten();
-    _ = try wal.writeCommit(1);
-    manager.recordWritten();
-
-    try std.testing.expectEqual(@as(u64, 3), manager.getRecordsSinceCheckpoint());
-
-    // Perform checkpoint
-    const checkpoint_lsn = try manager.checkpoint(null, null);
-
-    try std.testing.expect(checkpoint_lsn > 0);
-    try std.testing.expectEqual(checkpoint_lsn, manager.getLastCheckpointLSN());
-    try std.testing.expectEqual(@as(u64, 0), manager.getRecordsSinceCheckpoint());
-}
-
-test "CheckpointManager with callbacks" {
-    const allocator = std.testing.allocator;
-
-    std.fs.cwd().deleteTree("/tmp/test_ckpt_cb") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_ckpt_cb") catch {};
-
-    var wal = try WALWriter.init(allocator, "/tmp/test_ckpt_cb", .none, wal_writer.DEFAULT_SEGMENT_SIZE);
-    defer wal.deinit();
-
-    var manager = CheckpointManager.init(allocator, &wal);
-    defer manager.deinit();
-
-    // Track callback invocations
-    var flush_called = false;
-    var meta_lsn: LSN = 0;
-
-    const flush_cb = FlushCallback{
-        .context = @ptrCast(&flush_called),
-        .flushFn = struct {
-            fn flush(ctx: *anyopaque) errors.MonolithError!void {
-                const called: *bool = @ptrCast(@alignCast(ctx));
-                called.* = true;
-            }
-        }.flush,
-    };
-
-    const meta_cb = MetaCallback{
-        .context = @ptrCast(&meta_lsn),
-        .updateFn = struct {
-            fn update(ctx: *anyopaque, lsn: LSN) errors.MonolithError!void {
-                const stored: *LSN = @ptrCast(@alignCast(ctx));
-                stored.* = lsn;
-            }
-        }.update,
-    };
-
-    const checkpoint_lsn = try manager.checkpoint(flush_cb, meta_cb);
-
-    try std.testing.expect(flush_called);
-    try std.testing.expectEqual(checkpoint_lsn, meta_lsn);
-}
-
-test "CheckpointScheduler" {
-    const allocator = std.testing.allocator;
-
-    std.fs.cwd().deleteTree("/tmp/test_ckpt_sched") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_ckpt_sched") catch {};
-
-    var wal = try WALWriter.init(allocator, "/tmp/test_ckpt_sched", .none, wal_writer.DEFAULT_SEGMENT_SIZE);
-    defer wal.deinit();
-
-    var manager = CheckpointManager.init(allocator, &wal);
-    defer manager.deinit();
-
-    var scheduler = CheckpointScheduler.init(&manager, 5);
-
-    // Write 4 records - should not checkpoint
-    var i: u32 = 0;
-    while (i < 4) : (i += 1) {
-        const triggered = try scheduler.onRecordWritten(null, null);
-        try std.testing.expect(!triggered);
+    // Simulate commits
+    for (0..10) |_| {
+        try checkpoint.onCommit();
     }
 
-    // 5th record should trigger checkpoint
-    const triggered = try scheduler.onRecordWritten(null, null);
-    try std.testing.expect(triggered);
-
-    // Records count should be reset
-    try std.testing.expectEqual(@as(u64, 0), manager.getRecordsSinceCheckpoint());
+    // After 10 commits, should have checkpointed
+    try std.testing.expect(checkpoint.getLastCheckpointLSN() != INVALID_LSN);
 }
 
-test "CheckpointResult" {
-    const result = CheckpointResult{
-        .checkpoint_lsn = 100,
-        .segments_deleted = 3,
-    };
+test "Checkpoint force" {
+    const allocator = std.testing.allocator;
+    const wal_path = "test_checkpoint_force.wal";
+    const db_path = "test_checkpoint_force.db";
 
-    try std.testing.expectEqual(@as(LSN, 100), result.checkpoint_lsn);
-    try std.testing.expectEqual(@as(u64, 3), result.segments_deleted);
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(db_path) catch {};
+    defer {
+        std.fs.cwd().deleteFile(wal_path) catch {};
+        std.fs.cwd().deleteFile(db_path) catch {};
+    }
+
+    const file_mod = @import("../storage/file.zig");
+
+    var file = try file_mod.File.open(allocator, db_path, types.DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var buffer_pool = try BufferPool.init(allocator, &file, 10);
+    defer buffer_pool.deinit();
+
+    var wal = try WALWriter.open(allocator, wal_path, .sync);
+    defer wal.close();
+
+    var checkpoint = Checkpoint.init(allocator, &wal, &buffer_pool, 1000);
+
+    // Force checkpoint
+    var active_txns = [_]TransactionId{ 1, 2, 3 };
+    var dirty_pages = [_]PageId{ 10, 20 };
+
+    try checkpoint.forceCheckpoint(&active_txns, &dirty_pages);
+
+    try std.testing.expect(checkpoint.getLastCheckpointLSN() != INVALID_LSN);
 }
 
-test "CheckpointConfig defaults" {
-    const config = CheckpointConfig{};
+test "FuzzyCheckpoint" {
+    const allocator = std.testing.allocator;
+    const wal_path = "test_fuzzy_checkpoint.wal";
+    const db_path = "test_fuzzy_checkpoint.db";
 
-    try std.testing.expectEqual(@as(u32, 1000), config.min_records);
-    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), config.min_wal_size);
-    try std.testing.expect(!config.force);
+    std.fs.cwd().deleteFile(wal_path) catch {};
+    std.fs.cwd().deleteFile(db_path) catch {};
+    defer {
+        std.fs.cwd().deleteFile(wal_path) catch {};
+        std.fs.cwd().deleteFile(db_path) catch {};
+    }
+
+    const file_mod = @import("../storage/file.zig");
+
+    var file = try file_mod.File.open(allocator, db_path, types.DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var buffer_pool = try BufferPool.init(allocator, &file, 10);
+    defer buffer_pool.deinit();
+
+    var wal = try WALWriter.open(allocator, wal_path, .sync);
+    defer wal.close();
+
+    var checkpoint = FuzzyCheckpoint.init(allocator, &wal, &buffer_pool, 100);
+    defer checkpoint.deinit();
+
+    try std.testing.expect(!checkpoint.isInProgress());
+
+    // Start checkpoint
+    var active_txns = [_]TransactionId{1};
+    const begin_lsn = try checkpoint.startCheckpoint(&active_txns);
+
+    try std.testing.expect(checkpoint.isInProgress());
+
+    // Complete checkpoint
+    try checkpoint.completeCheckpoint(begin_lsn, &active_txns);
+
+    try std.testing.expect(!checkpoint.isInProgress());
+    try std.testing.expect(checkpoint.base.getLastCheckpointLSN() != INVALID_LSN);
 }

@@ -3,7 +3,7 @@ const types = @import("../core/types.zig");
 const errors = @import("../core/errors.zig");
 
 const TransactionId = types.TransactionId;
-const PageId = types.PageId;
+const Key = types.Key;
 const INVALID_TXN_ID = types.INVALID_TXN_ID;
 
 /// Lock mode
@@ -14,116 +14,136 @@ pub const LockMode = enum {
     exclusive,
 };
 
-/// Lock request status
-pub const LockStatus = enum {
-    /// Lock granted
-    granted,
-    /// Lock waiting
-    waiting,
-    /// Lock denied (timeout or conflict)
-    denied,
-};
-
-/// A single lock holder
-const LockHolder = struct {
+/// Lock request
+pub const LockRequest = struct {
     txn_id: TransactionId,
     mode: LockMode,
+    granted: bool,
 };
 
-/// Lock entry for a resource
-const LockEntry = struct {
-    /// Current holders of the lock
-    holders: std.ArrayList(LockHolder),
-    /// Waiting requests
-    waiters: std.ArrayList(LockHolder),
+/// Lock entry for a single key
+pub const LockEntry = struct {
+    /// Key (owned copy)
+    key: []u8,
+    /// Lock mode currently held
+    mode: ?LockMode,
+    /// Transactions holding the lock
+    holders: std.ArrayListUnmanaged(TransactionId),
+    /// Waiting requests queue
+    waiters: std.ArrayListUnmanaged(LockRequest),
     /// Allocator
     allocator: std.mem.Allocator,
 
-    fn init(allocator: std.mem.Allocator) LockEntry {
+    /// Initialize lock entry
+    pub fn init(allocator: std.mem.Allocator, key: Key) !LockEntry {
+        const key_copy = try allocator.alloc(u8, key.len);
+        @memcpy(key_copy, key);
+
         return .{
+            .key = key_copy,
+            .mode = null,
             .holders = .{},
             .waiters = .{},
             .allocator = allocator,
         };
     }
 
-    fn deinit(self: *LockEntry) void {
+    /// Free resources
+    pub fn deinit(self: *LockEntry) void {
+        self.allocator.free(self.key);
         self.holders.deinit(self.allocator);
         self.waiters.deinit(self.allocator);
     }
 
     /// Check if lock can be granted
-    fn canGrant(self: *const LockEntry, mode: LockMode, txn_id: TransactionId) bool {
-        // If no holders, always grant
-        if (self.holders.items.len == 0) return true;
+    pub fn canGrant(self: *const LockEntry, mode: LockMode) bool {
+        if (self.mode == null) return true;
 
-        // Check existing holders
-        for (self.holders.items) |holder| {
-            // Same transaction can upgrade
-            if (holder.txn_id == txn_id) continue;
-
-            // Shared locks are compatible with each other
-            if (mode == .shared and holder.mode == .shared) continue;
-
-            // Any exclusive lock conflicts
-            return false;
-        }
-
-        return true;
+        return switch (mode) {
+            .shared => self.mode.? == .shared,
+            .exclusive => false,
+        };
     }
 
-    /// Check if transaction already holds this lock
-    fn isHeldBy(self: *const LockEntry, txn_id: TransactionId) bool {
+    /// Try to acquire lock
+    pub fn acquire(self: *LockEntry, txn_id: TransactionId, mode: LockMode) !bool {
+        // Check if this transaction already holds the lock
         for (self.holders.items) |holder| {
-            if (holder.txn_id == txn_id) return true;
-        }
-        return false;
-    }
-
-    /// Get lock mode held by transaction
-    fn getModeHeldBy(self: *const LockEntry, txn_id: TransactionId) ?LockMode {
-        for (self.holders.items) |holder| {
-            if (holder.txn_id == txn_id) return holder.mode;
-        }
-        return null;
-    }
-
-    /// Add a holder
-    fn addHolder(self: *LockEntry, txn_id: TransactionId, mode: LockMode) !void {
-        // Check for upgrade
-        for (self.holders.items) |*holder| {
-            if (holder.txn_id == txn_id) {
-                // Upgrade to exclusive if needed
-                if (mode == .exclusive) {
-                    holder.mode = .exclusive;
+            if (holder == txn_id) {
+                // Already holding - check for upgrade
+                if (mode == .exclusive and self.mode.? == .shared) {
+                    // Can only upgrade if we're the only holder
+                    if (self.holders.items.len == 1) {
+                        self.mode = .exclusive;
+                        return true;
+                    }
+                    // Need to wait for upgrade
+                    try self.waiters.append(self.allocator, .{
+                        .txn_id = txn_id,
+                        .mode = mode,
+                        .granted = false,
+                    });
+                    return false;
                 }
-                return;
-            }
-        }
-        try self.holders.append(self.allocator, .{ .txn_id = txn_id, .mode = mode });
-    }
-
-    /// Remove a holder
-    fn removeHolder(self: *LockEntry, txn_id: TransactionId) bool {
-        for (self.holders.items, 0..) |holder, i| {
-            if (holder.txn_id == txn_id) {
-                _ = self.holders.orderedRemove(i);
                 return true;
             }
         }
+
+        // Check if we can grant immediately
+        if (self.canGrant(mode)) {
+            try self.holders.append(self.allocator, txn_id);
+            self.mode = mode;
+            return true;
+        }
+
+        // Add to wait queue
+        try self.waiters.append(self.allocator, .{
+            .txn_id = txn_id,
+            .mode = mode,
+            .granted = false,
+        });
         return false;
     }
 
-    /// Add a waiter
-    fn addWaiter(self: *LockEntry, txn_id: TransactionId, mode: LockMode) !void {
-        try self.waiters.append(self.allocator, .{ .txn_id = txn_id, .mode = mode });
+    /// Release lock
+    pub fn release(self: *LockEntry, txn_id: TransactionId) void {
+        // Remove from holders
+        var i: usize = 0;
+        while (i < self.holders.items.len) {
+            if (self.holders.items[i] == txn_id) {
+                _ = self.holders.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        // If no more holders, clear mode and try to grant waiters
+        if (self.holders.items.len == 0) {
+            self.mode = null;
+            self.grantWaiters() catch {};
+        }
     }
 
-    /// Remove a waiter
-    fn removeWaiter(self: *LockEntry, txn_id: TransactionId) void {
+    /// Grant locks to waiting transactions
+    fn grantWaiters(self: *LockEntry) !void {
         var i: usize = 0;
         while (i < self.waiters.items.len) {
-            if (self.waiters.items[i].txn_id == txn_id) {
+            const req = &self.waiters.items[i];
+            if (!req.granted and self.canGrant(req.mode)) {
+                try self.holders.append(self.allocator, req.txn_id);
+                self.mode = req.mode;
+                req.granted = true;
+
+                // If exclusive, stop granting
+                if (req.mode == .exclusive) break;
+            }
+            i += 1;
+        }
+
+        // Remove granted requests
+        i = 0;
+        while (i < self.waiters.items.len) {
+            if (self.waiters.items[i].granted) {
                 _ = self.waiters.orderedRemove(i);
             } else {
                 i += 1;
@@ -131,457 +151,340 @@ const LockEntry = struct {
         }
     }
 
-    /// Try to grant waiting locks
-    fn grantWaiters(self: *LockEntry) u32 {
-        var granted: u32 = 0;
-        var i: usize = 0;
-        while (i < self.waiters.items.len) {
-            const waiter = self.waiters.items[i];
-            if (self.canGrant(waiter.mode, waiter.txn_id)) {
-                self.addHolder(waiter.txn_id, waiter.mode) catch {
-                    i += 1;
-                    continue;
-                };
-                _ = self.waiters.orderedRemove(i);
-                granted += 1;
-            } else {
-                i += 1;
-            }
+    /// Check if transaction holds the lock
+    pub fn isHeldBy(self: *const LockEntry, txn_id: TransactionId) bool {
+        for (self.holders.items) |holder| {
+            if (holder == txn_id) return true;
         }
-        return granted;
+        return false;
     }
 };
 
-/// Lock manager for concurrency control
+/// Lock manager
 pub const LockManager = struct {
+    /// Key to lock entry mapping
+    locks: std.StringHashMap(*LockEntry),
+    /// Transaction to locks mapping (for cleanup)
+    txn_locks: std.AutoHashMap(TransactionId, std.ArrayListUnmanaged([]const u8)),
+    /// Allocator
     allocator: std.mem.Allocator,
-    /// Page locks: page_id -> lock entry
-    page_locks: std.AutoHashMap(PageId, LockEntry),
-    /// Key locks: key hash -> lock entry
-    key_locks: std.AutoHashMap(u64, LockEntry),
-    /// Default timeout in nanoseconds
-    default_timeout_ns: u64,
-    /// Statistics
-    locks_acquired: u64,
-    locks_released: u64,
-    lock_waits: u64,
-    lock_timeouts: u64,
+    /// Mutex for thread safety
+    mutex: std.Thread.Mutex,
+    /// Lock timeout in milliseconds
+    timeout_ms: u64,
 
-    pub fn init(allocator: std.mem.Allocator) LockManager {
+    /// Initialize lock manager
+    pub fn init(allocator: std.mem.Allocator, timeout_ms: u64) LockManager {
         return .{
+            .locks = std.StringHashMap(*LockEntry).init(allocator),
+            .txn_locks = std.AutoHashMap(TransactionId, std.ArrayListUnmanaged([]const u8)).init(allocator),
             .allocator = allocator,
-            .page_locks = std.AutoHashMap(PageId, LockEntry).init(allocator),
-            .key_locks = std.AutoHashMap(u64, LockEntry).init(allocator),
-            .default_timeout_ns = 5 * std.time.ns_per_s, // 5 seconds
-            .locks_acquired = 0,
-            .locks_released = 0,
-            .lock_waits = 0,
-            .lock_timeouts = 0,
+            .mutex = .{},
+            .timeout_ms = timeout_ms,
         };
     }
 
+    /// Free resources
     pub fn deinit(self: *LockManager) void {
-        var page_it = self.page_locks.iterator();
-        while (page_it.next()) |entry| {
-            entry.value_ptr.deinit();
+        var iter = self.locks.valueIterator();
+        while (iter.next()) |entry_ptr| {
+            entry_ptr.*.deinit();
+            self.allocator.destroy(entry_ptr.*);
         }
-        self.page_locks.deinit();
+        self.locks.deinit();
 
-        var key_it = self.key_locks.iterator();
-        while (key_it.next()) |entry| {
-            entry.value_ptr.deinit();
+        var txn_iter = self.txn_locks.valueIterator();
+        while (txn_iter.next()) |list_ptr| {
+            list_ptr.deinit(self.allocator);
         }
-        self.key_locks.deinit();
+        self.txn_locks.deinit();
     }
 
-    /// Set default timeout
-    pub fn setTimeout(self: *LockManager, timeout_ns: u64) void {
-        self.default_timeout_ns = timeout_ns;
-    }
-
-    /// Acquire a page lock
-    pub fn lockPage(
-        self: *LockManager,
-        page_id: PageId,
-        txn_id: TransactionId,
-        mode: LockMode,
-    ) errors.MonolithError!LockStatus {
-        const result = self.page_locks.getOrPut(page_id) catch {
-            return errors.Error.OutOfSpace;
-        };
-
-        if (!result.found_existing) {
-            result.value_ptr.* = LockEntry.init(self.allocator);
+    /// Get or create lock entry
+    fn getOrCreateEntry(self: *LockManager, key: Key) !*LockEntry {
+        if (self.locks.get(key)) |entry| {
+            return entry;
         }
 
-        return self.acquireLock(result.value_ptr, txn_id, mode);
+        const entry = try self.allocator.create(LockEntry);
+        entry.* = try LockEntry.init(self.allocator, key);
+        try self.locks.put(entry.key, entry);
+        return entry;
     }
 
-    /// Release a page lock
-    pub fn unlockPage(
-        self: *LockManager,
-        page_id: PageId,
-        txn_id: TransactionId,
-    ) bool {
-        if (self.page_locks.getPtr(page_id)) |entry| {
-            if (entry.removeHolder(txn_id)) {
-                self.locks_released += 1;
-                _ = entry.grantWaiters();
-                return true;
+    /// Acquire a lock (blocking with timeout)
+    pub fn acquire(self: *LockManager, txn_id: TransactionId, key: Key, mode: LockMode) !void {
+        self.mutex.lock();
+
+        const entry = try self.getOrCreateEntry(key);
+        const granted = try entry.acquire(txn_id, mode);
+
+        if (granted) {
+            try self.recordLock(txn_id, key);
+            self.mutex.unlock();
+            return;
+        }
+
+        self.mutex.unlock();
+
+        // Wait for lock
+        const start = std.time.milliTimestamp();
+        while (std.time.milliTimestamp() - start < @as(i64, @intCast(self.timeout_ms))) {
+            std.Thread.sleep(1_000_000); // 1ms
+
+            self.mutex.lock();
+            // Check if we got the lock
+            if (entry.isHeldBy(txn_id)) {
+                try self.recordLock(txn_id, key);
+                self.mutex.unlock();
+                return;
+            }
+            self.mutex.unlock();
+        }
+
+        // Timeout - remove from waiters
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var i: usize = 0;
+        while (i < entry.waiters.items.len) {
+            if (entry.waiters.items[i].txn_id == txn_id) {
+                _ = entry.waiters.orderedRemove(i);
+            } else {
+                i += 1;
             }
         }
+
+        return errors.Error.LockTimeout;
+    }
+
+    /// Try to acquire lock without waiting
+    pub fn tryAcquire(self: *LockManager, txn_id: TransactionId, key: Key, mode: LockMode) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const entry = try self.getOrCreateEntry(key);
+
+        // Only grant if immediately available
+        if (entry.canGrant(mode)) {
+            try entry.holders.append(entry.allocator, txn_id);
+            entry.mode = mode;
+            try self.recordLock(txn_id, key);
+            return true;
+        }
+
         return false;
     }
 
-    /// Acquire a key lock
-    pub fn lockKey(
-        self: *LockManager,
-        key: []const u8,
-        txn_id: TransactionId,
-        mode: LockMode,
-    ) errors.MonolithError!LockStatus {
-        const key_hash = std.hash.Wyhash.hash(0, key);
+    /// Release a specific lock
+    pub fn release(self: *LockManager, txn_id: TransactionId, key: Key) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
-        const result = self.key_locks.getOrPut(key_hash) catch {
-            return errors.Error.OutOfSpace;
-        };
-
-        if (!result.found_existing) {
-            result.value_ptr.* = LockEntry.init(self.allocator);
+        if (self.locks.get(key)) |entry| {
+            entry.release(txn_id);
         }
-
-        return self.acquireLock(result.value_ptr, txn_id, mode);
     }
 
-    /// Release a key lock
-    pub fn unlockKey(
-        self: *LockManager,
-        key: []const u8,
-        txn_id: TransactionId,
-    ) bool {
-        const key_hash = std.hash.Wyhash.hash(0, key);
+    /// Release all locks for a transaction
+    pub fn releaseAll(self: *LockManager, txn_id: TransactionId) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
-        if (self.key_locks.getPtr(key_hash)) |entry| {
-            if (entry.removeHolder(txn_id)) {
-                self.locks_released += 1;
-                _ = entry.grantWaiters();
-                return true;
+        if (self.txn_locks.getPtr(txn_id)) |list| {
+            for (list.items) |key| {
+                if (self.locks.get(key)) |entry| {
+                    entry.release(txn_id);
+                }
+            }
+            list.deinit(self.allocator);
+            _ = self.txn_locks.remove(txn_id);
+        }
+    }
+
+    /// Record that a transaction holds a lock
+    fn recordLock(self: *LockManager, txn_id: TransactionId, key: Key) !void {
+        const gop = try self.txn_locks.getOrPut(txn_id);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        try gop.value_ptr.append(self.allocator, key);
+    }
+
+    /// Check for deadlock (simple cycle detection)
+    pub fn hasDeadlock(self: *LockManager, txn_id: TransactionId, key: Key) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Simple wait-for graph cycle detection
+        var visited = std.AutoHashMap(TransactionId, void).init(self.allocator);
+        defer visited.deinit();
+
+        return self.detectCycle(txn_id, key, &visited);
+    }
+
+    fn detectCycle(self: *LockManager, start_txn: TransactionId, key: Key, visited: *std.AutoHashMap(TransactionId, void)) bool {
+        if (visited.contains(start_txn)) {
+            return true;
+        }
+        visited.put(start_txn, {}) catch return false;
+
+        const entry = self.locks.get(key) orelse return false;
+
+        // Check if any holder is waiting for a lock we hold
+        for (entry.holders.items) |holder| {
+            if (holder == start_txn) continue;
+
+            // Check what this holder is waiting for
+            if (self.txn_locks.get(holder)) |held_keys| {
+                for (held_keys.items) |held_key| {
+                    if (self.detectCycle(holder, held_key, visited)) {
+                        return true;
+                    }
+                }
             }
         }
+
         return false;
     }
 
-    /// Release all locks held by a transaction
-    pub fn releaseAll(self: *LockManager, txn_id: TransactionId) u32 {
-        var released: u32 = 0;
-
-        // Release page locks
-        var page_it = self.page_locks.iterator();
-        while (page_it.next()) |entry| {
-            if (entry.value_ptr.removeHolder(txn_id)) {
-                released += 1;
-                _ = entry.value_ptr.grantWaiters();
-            }
-            entry.value_ptr.removeWaiter(txn_id);
-        }
-
-        // Release key locks
-        var key_it = self.key_locks.iterator();
-        while (key_it.next()) |entry| {
-            if (entry.value_ptr.removeHolder(txn_id)) {
-                released += 1;
-                _ = entry.value_ptr.grantWaiters();
-            }
-            entry.value_ptr.removeWaiter(txn_id);
-        }
-
-        self.locks_released += released;
-        return released;
-    }
-
-    /// Try to acquire a lock
-    fn acquireLock(
-        self: *LockManager,
-        entry: *LockEntry,
-        txn_id: TransactionId,
-        mode: LockMode,
-    ) errors.MonolithError!LockStatus {
-        // Already held?
-        if (entry.isHeldBy(txn_id)) {
-            const current_mode = entry.getModeHeldBy(txn_id).?;
-            if (mode == .shared or current_mode == .exclusive) {
-                return .granted; // Already have sufficient lock
-            }
-            // Need upgrade
-        }
-
-        // Can grant immediately?
-        if (entry.canGrant(mode, txn_id)) {
-            entry.addHolder(txn_id, mode) catch {
-                return errors.Error.OutOfSpace;
-            };
-            self.locks_acquired += 1;
-            return .granted;
-        }
-
-        // Would need to wait
-        self.lock_waits += 1;
-        return .waiting;
-    }
-
-    /// Try to acquire page lock with timeout-based waiting
-    pub fn tryLockPageWithWait(
-        self: *LockManager,
-        page_id: PageId,
-        txn_id: TransactionId,
-        mode: LockMode,
-    ) errors.MonolithError!LockStatus {
-        return self.lockWithTimeout(page_id, null, txn_id, mode, self.default_timeout_ns);
-    }
-
-    /// Try to acquire key lock with timeout-based waiting
-    pub fn tryLockKeyWithWait(
-        self: *LockManager,
-        key: []const u8,
-        txn_id: TransactionId,
-        mode: LockMode,
-    ) errors.MonolithError!LockStatus {
-        const key_hash = std.hash.Wyhash.hash(0, key);
-        return self.lockWithTimeout(null, key_hash, txn_id, mode, self.default_timeout_ns);
-    }
-
-    /// Internal: acquire lock with timeout
-    fn lockWithTimeout(
-        self: *LockManager,
-        page_id: ?PageId,
-        key_hash: ?u64,
-        txn_id: TransactionId,
-        mode: LockMode,
-        timeout_ns: u64,
-    ) errors.MonolithError!LockStatus {
-        const start_time = std.time.nanoTimestamp();
-        const deadline = start_time + @as(i128, timeout_ns);
-
-        // Spin interval starts small and grows
-        var spin_ns: u64 = 1000; // 1 microsecond
-        const max_spin_ns: u64 = 10_000_000; // 10 milliseconds
-
-        while (true) {
-            // Try to acquire lock
-            const status = if (page_id) |pid|
-                try self.lockPage(pid, txn_id, mode)
-            else if (key_hash) |kh|
-                try self.lockKeyHash(kh, txn_id, mode)
-            else
-                return .denied;
-
-            if (status == .granted) {
-                return .granted;
-            }
-
-            // Check timeout
-            const now = std.time.nanoTimestamp();
-            if (now >= deadline) {
-                self.lock_timeouts += 1;
-                return .denied;
-            }
-
-            // Sleep with exponential backoff
-            std.time.sleep(spin_ns);
-            spin_ns = @min(spin_ns * 2, max_spin_ns);
-        }
-    }
-
-    /// Lock a key by its hash (internal)
-    fn lockKeyHash(
-        self: *LockManager,
-        key_hash: u64,
-        txn_id: TransactionId,
-        mode: LockMode,
-    ) errors.MonolithError!LockStatus {
-        const result = self.key_locks.getOrPut(key_hash) catch {
-            return errors.Error.OutOfSpace;
-        };
-
-        if (!result.found_existing) {
-            result.value_ptr.* = LockEntry.init(self.allocator);
-        }
-
-        return self.acquireLock(result.value_ptr, txn_id, mode);
-    }
-
-    /// Get lock statistics
-    pub fn getStats(self: *const LockManager) LockStats {
+    /// Get lock stats
+    pub fn stats(self: *const LockManager) LockStats {
         return .{
-            .acquired = self.locks_acquired,
-            .released = self.locks_released,
-            .waits = self.lock_waits,
-            .timeouts = self.lock_timeouts,
-            .page_locks = self.page_locks.count(),
-            .key_locks = self.key_locks.count(),
+            .total_locks = self.locks.count(),
         };
-    }
-
-    /// Check if transaction holds a lock
-    pub fn holdsPageLock(self: *const LockManager, page_id: PageId, txn_id: TransactionId) bool {
-        if (self.page_locks.getPtr(page_id)) |entry| {
-            return entry.isHeldBy(txn_id);
-        }
-        return false;
-    }
-
-    /// Check if transaction holds a key lock
-    pub fn holdsKeyLock(self: *const LockManager, key: []const u8, txn_id: TransactionId) bool {
-        const key_hash = std.hash.Wyhash.hash(0, key);
-        if (self.key_locks.getPtr(key_hash)) |entry| {
-            return entry.isHeldBy(txn_id);
-        }
-        return false;
     }
 };
 
 /// Lock statistics
 pub const LockStats = struct {
-    acquired: u64,
-    released: u64,
-    waits: u64,
-    timeouts: u64,
-    page_locks: usize,
-    key_locks: usize,
+    total_locks: usize,
 };
 
 // Tests
 
-test "LockManager init" {
+test "LockEntry shared lock" {
     const allocator = std.testing.allocator;
 
-    var manager = LockManager.init(allocator);
-    defer manager.deinit();
+    var entry = try LockEntry.init(allocator, "key");
+    defer entry.deinit();
 
-    const stats = manager.getStats();
-    try std.testing.expectEqual(@as(u64, 0), stats.acquired);
+    // First shared lock granted
+    try std.testing.expect(try entry.acquire(1, .shared));
+    try std.testing.expectEqual(LockMode.shared, entry.mode.?);
+
+    // Second shared lock granted (compatible)
+    try std.testing.expect(try entry.acquire(2, .shared));
+    try std.testing.expectEqual(@as(usize, 2), entry.holders.items.len);
 }
 
-test "LockManager page lock" {
+test "LockEntry exclusive lock" {
     const allocator = std.testing.allocator;
 
-    var manager = LockManager.init(allocator);
+    var entry = try LockEntry.init(allocator, "key");
+    defer entry.deinit();
+
+    // First exclusive lock granted
+    try std.testing.expect(try entry.acquire(1, .exclusive));
+    try std.testing.expectEqual(LockMode.exclusive, entry.mode.?);
+
+    // Second exclusive lock blocked
+    try std.testing.expect(!try entry.acquire(2, .exclusive));
+    try std.testing.expectEqual(@as(usize, 1), entry.waiters.items.len);
+}
+
+test "LockEntry shared blocked by exclusive" {
+    const allocator = std.testing.allocator;
+
+    var entry = try LockEntry.init(allocator, "key");
+    defer entry.deinit();
+
+    // Exclusive lock first
+    try std.testing.expect(try entry.acquire(1, .exclusive));
+
+    // Shared lock blocked
+    try std.testing.expect(!try entry.acquire(2, .shared));
+}
+
+test "LockEntry release grants waiters" {
+    const allocator = std.testing.allocator;
+
+    var entry = try LockEntry.init(allocator, "key");
+    defer entry.deinit();
+
+    // Exclusive lock
+    try std.testing.expect(try entry.acquire(1, .exclusive));
+
+    // Waiter
+    try std.testing.expect(!try entry.acquire(2, .shared));
+
+    // Release exclusive
+    entry.release(1);
+
+    // Waiter should be granted
+    try std.testing.expect(entry.isHeldBy(2));
+}
+
+test "LockManager basic" {
+    const allocator = std.testing.allocator;
+
+    var manager = LockManager.init(allocator, 100);
     defer manager.deinit();
 
-    // Acquire exclusive lock
-    const status = try manager.lockPage(1, 100, .exclusive);
-    try std.testing.expectEqual(LockStatus.granted, status);
-    try std.testing.expect(manager.holdsPageLock(1, 100));
+    // Acquire shared lock
+    try manager.acquire(1, "key", .shared);
 
     // Release
-    try std.testing.expect(manager.unlockPage(1, 100));
-    try std.testing.expect(!manager.holdsPageLock(1, 100));
+    manager.release(1, "key");
 }
 
-test "LockManager shared locks compatible" {
+test "LockManager tryAcquire" {
     const allocator = std.testing.allocator;
 
-    var manager = LockManager.init(allocator);
+    var manager = LockManager.init(allocator, 100);
     defer manager.deinit();
 
-    // Multiple shared locks should be compatible
-    const s1 = try manager.lockPage(1, 100, .shared);
-    const s2 = try manager.lockPage(1, 101, .shared);
-    const s3 = try manager.lockPage(1, 102, .shared);
+    // First exclusive succeeds
+    try std.testing.expect(try manager.tryAcquire(1, "key", .exclusive));
 
-    try std.testing.expectEqual(LockStatus.granted, s1);
-    try std.testing.expectEqual(LockStatus.granted, s2);
-    try std.testing.expectEqual(LockStatus.granted, s3);
+    // Second fails immediately
+    try std.testing.expect(!try manager.tryAcquire(2, "key", .shared));
+
+    manager.releaseAll(1);
 }
 
-test "LockManager exclusive blocks" {
+test "LockManager releaseAll" {
     const allocator = std.testing.allocator;
 
-    var manager = LockManager.init(allocator);
+    var manager = LockManager.init(allocator, 100);
     defer manager.deinit();
 
-    // Acquire exclusive lock
-    const x1 = try manager.lockPage(1, 100, .exclusive);
-    try std.testing.expectEqual(LockStatus.granted, x1);
+    try manager.acquire(1, "key1", .shared);
+    try manager.acquire(1, "key2", .exclusive);
 
-    // Another exclusive should wait
-    const x2 = try manager.lockPage(1, 101, .exclusive);
-    try std.testing.expectEqual(LockStatus.waiting, x2);
+    // Release all for txn 1
+    manager.releaseAll(1);
 
-    // Shared should also wait
-    const s1 = try manager.lockPage(1, 102, .shared);
-    try std.testing.expectEqual(LockStatus.waiting, s1);
+    // Now other txn can acquire
+    try std.testing.expect(try manager.tryAcquire(2, "key1", .exclusive));
+    try std.testing.expect(try manager.tryAcquire(2, "key2", .exclusive));
+
+    manager.releaseAll(2);
 }
 
-test "LockManager key lock" {
+test "LockManager stats" {
     const allocator = std.testing.allocator;
 
-    var manager = LockManager.init(allocator);
+    var manager = LockManager.init(allocator, 100);
     defer manager.deinit();
 
-    const status = try manager.lockKey("mykey", 100, .shared);
-    try std.testing.expectEqual(LockStatus.granted, status);
-    try std.testing.expect(manager.holdsKeyLock("mykey", 100));
+    try std.testing.expectEqual(@as(usize, 0), manager.stats().total_locks);
 
-    try std.testing.expect(manager.unlockKey("mykey", 100));
-}
+    try manager.acquire(1, "key1", .shared);
+    try std.testing.expectEqual(@as(usize, 1), manager.stats().total_locks);
 
-test "LockManager release all" {
-    const allocator = std.testing.allocator;
+    try manager.acquire(1, "key2", .shared);
+    try std.testing.expectEqual(@as(usize, 2), manager.stats().total_locks);
 
-    var manager = LockManager.init(allocator);
-    defer manager.deinit();
-
-    // Acquire multiple locks
-    _ = try manager.lockPage(1, 100, .exclusive);
-    _ = try manager.lockPage(2, 100, .shared);
-    _ = try manager.lockKey("k1", 100, .exclusive);
-    _ = try manager.lockKey("k2", 100, .shared);
-
-    // Release all for txn 100
-    const released = manager.releaseAll(100);
-    try std.testing.expectEqual(@as(u32, 4), released);
-}
-
-test "LockManager reentrant" {
-    const allocator = std.testing.allocator;
-
-    var manager = LockManager.init(allocator);
-    defer manager.deinit();
-
-    // Same transaction can acquire same lock multiple times
-    const s1 = try manager.lockPage(1, 100, .shared);
-    const s2 = try manager.lockPage(1, 100, .shared);
-
-    try std.testing.expectEqual(LockStatus.granted, s1);
-    try std.testing.expectEqual(LockStatus.granted, s2);
-}
-
-test "LockManager upgrade" {
-    const allocator = std.testing.allocator;
-
-    var manager = LockManager.init(allocator);
-    defer manager.deinit();
-
-    // Start with shared
-    const s1 = try manager.lockPage(1, 100, .shared);
-    try std.testing.expectEqual(LockStatus.granted, s1);
-
-    // Upgrade to exclusive (same txn, no other holders)
-    const x1 = try manager.lockPage(1, 100, .exclusive);
-    try std.testing.expectEqual(LockStatus.granted, x1);
-}
-
-test "LockStats" {
-    const stats = LockStats{
-        .acquired = 100,
-        .released = 80,
-        .waits = 10,
-        .timeouts = 2,
-        .page_locks = 50,
-        .key_locks = 30,
-    };
-
-    try std.testing.expectEqual(@as(u64, 100), stats.acquired);
-    try std.testing.expectEqual(@as(usize, 50), stats.page_locks);
+    manager.releaseAll(1);
 }

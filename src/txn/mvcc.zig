@@ -3,490 +3,338 @@ const types = @import("../core/types.zig");
 const errors = @import("../core/errors.zig");
 
 const TransactionId = types.TransactionId;
-const LSN = types.LSN;
-const IsolationLevel = types.IsolationLevel;
+const Key = types.Key;
+const Value = types.Value;
 const INVALID_TXN_ID = types.INVALID_TXN_ID;
-const INVALID_LSN = types.INVALID_LSN;
 
-/// A single version of a key-value pair
+/// Version chain entry for MVCC
 pub const Version = struct {
     /// Transaction that created this version
     created_by: TransactionId,
-    /// Transaction that deleted this version (or INVALID_TXN_ID if not deleted)
+    /// Transaction that deleted this version (INVALID_TXN_ID if live)
     deleted_by: TransactionId,
-    /// LSN when this version was created
-    created_lsn: LSN,
-    /// LSN when this version was deleted (or INVALID_LSN if not deleted)
-    deleted_lsn: LSN,
-    /// The value (owned)
-    value: []const u8,
-    /// Next older version (forms a chain)
-    prev: ?*Version,
+    /// Creation timestamp
+    begin_ts: u64,
+    /// Deletion timestamp (max if not deleted)
+    end_ts: u64,
+    /// Value data (owned)
+    value: []u8,
+    /// Next older version
+    next: ?*Version,
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        created_by: TransactionId,
-        created_lsn: LSN,
-        value: []const u8,
-    ) !*Version {
-        const version = try allocator.create(Version);
-        version.* = .{
-            .created_by = created_by,
-            .deleted_by = INVALID_TXN_ID,
-            .created_lsn = created_lsn,
-            .deleted_lsn = INVALID_LSN,
-            .value = try allocator.dupe(u8, value),
-            .prev = null,
-        };
-        return version;
-    }
-
-    pub fn deinit(self: *Version, allocator: std.mem.Allocator) void {
-        allocator.free(self.value);
-        allocator.destroy(self);
-    }
-
-    /// Mark this version as deleted
-    pub fn markDeleted(self: *Version, deleted_by: TransactionId, deleted_lsn: LSN) void {
-        self.deleted_by = deleted_by;
-        self.deleted_lsn = deleted_lsn;
-    }
-
-    /// Check if version is deleted
-    pub fn isDeleted(self: *const Version) bool {
-        return self.deleted_by != INVALID_TXN_ID;
+    /// Check if this version is visible to a transaction
+    pub fn isVisibleTo(self: *const Version, read_ts: u64) bool {
+        return self.begin_ts <= read_ts and read_ts < self.end_ts;
     }
 };
 
-/// Version chain for a single key
+/// MVCC version manager for a single key
 pub const VersionChain = struct {
-    /// Most recent version (head of chain)
+    /// Key (owned)
+    key: []u8,
+    /// Head of version chain (newest)
     head: ?*Version,
-    /// Number of versions in chain
-    version_count: u32,
     /// Allocator
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) VersionChain {
+    /// Initialize empty version chain
+    pub fn init(allocator: std.mem.Allocator, key: Key) !VersionChain {
+        const key_copy = try allocator.alloc(u8, key.len);
+        @memcpy(key_copy, key);
+
         return .{
-            .head = null,
-            .version_count = 0,
+            .key = key_copy,
             .allocator = allocator,
+            .head = null,
         };
     }
 
+    /// Free all resources
     pub fn deinit(self: *VersionChain) void {
         var current = self.head;
-        while (current) |version| {
-            const prev = version.prev;
-            version.deinit(self.allocator);
-            current = prev;
+        while (current) |v| {
+            const next = v.next;
+            self.allocator.free(v.value);
+            self.allocator.destroy(v);
+            current = next;
         }
-        self.head = null;
-        self.version_count = 0;
+        self.allocator.free(self.key);
     }
 
-    /// Add a new version to the chain (becomes head)
-    pub fn addVersion(
-        self: *VersionChain,
-        created_by: TransactionId,
-        created_lsn: LSN,
-        value: []const u8,
-    ) !*Version {
-        const version = try Version.init(self.allocator, created_by, created_lsn, value);
-        version.prev = self.head;
+    /// Add a new version
+    pub fn addVersion(self: *VersionChain, txn_id: TransactionId, ts: u64, value: Value) !void {
+        const version = try self.allocator.create(Version);
+        version.* = .{
+            .created_by = txn_id,
+            .deleted_by = INVALID_TXN_ID,
+            .begin_ts = ts,
+            .end_ts = std.math.maxInt(u64),
+            .value = try self.allocator.alloc(u8, value.len),
+            .next = self.head,
+        };
+        @memcpy(version.value, value);
+
+        // Mark previous head as deleted
+        if (self.head) |old_head| {
+            old_head.deleted_by = txn_id;
+            old_head.end_ts = ts;
+        }
+
         self.head = version;
-        self.version_count += 1;
-        return version;
     }
 
-    /// Mark the current head as deleted and return it
-    pub fn deleteHead(
-        self: *VersionChain,
-        deleted_by: TransactionId,
-        deleted_lsn: LSN,
-    ) ?*Version {
+    /// Mark current version as deleted
+    pub fn markDeleted(self: *VersionChain, txn_id: TransactionId, ts: u64) void {
         if (self.head) |head| {
-            head.markDeleted(deleted_by, deleted_lsn);
-            return head;
+            head.deleted_by = txn_id;
+            head.end_ts = ts;
+        }
+    }
+
+    /// Get version visible to transaction
+    pub fn getVisible(self: *const VersionChain, read_ts: u64) ?Value {
+        var current = self.head;
+        while (current) |v| {
+            if (v.isVisibleTo(read_ts)) {
+                return v.value;
+            }
+            current = v.next;
         }
         return null;
     }
 
-    /// Get the most recent version
-    pub fn getHead(self: *const VersionChain) ?*Version {
-        return self.head;
-    }
-
-    /// Get version count
-    pub fn getVersionCount(self: *const VersionChain) u32 {
-        return self.version_count;
-    }
-};
-
-/// Visibility checker for MVCC
-pub const VisibilityChecker = struct {
-    /// Set of committed transaction IDs
-    committed_txns: std.AutoHashMap(TransactionId, LSN),
-    /// Set of aborted transaction IDs
-    aborted_txns: std.AutoHashMap(TransactionId, void),
-    /// Allocator
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) VisibilityChecker {
-        return .{
-            .committed_txns = std.AutoHashMap(TransactionId, LSN).init(allocator),
-            .aborted_txns = std.AutoHashMap(TransactionId, void).init(allocator),
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *VisibilityChecker) void {
-        self.committed_txns.deinit();
-        self.aborted_txns.deinit();
-    }
-
-    /// Mark a transaction as committed
-    pub fn markCommitted(self: *VisibilityChecker, txn_id: TransactionId, commit_lsn: LSN) !void {
-        try self.committed_txns.put(txn_id, commit_lsn);
-    }
-
-    /// Mark a transaction as aborted
-    pub fn markAborted(self: *VisibilityChecker, txn_id: TransactionId) !void {
-        try self.aborted_txns.put(txn_id, {});
-    }
-
-    /// Check if a transaction is committed
-    pub fn isCommitted(self: *const VisibilityChecker, txn_id: TransactionId) bool {
-        return self.committed_txns.contains(txn_id);
-    }
-
-    /// Check if a transaction is aborted
-    pub fn isAborted(self: *const VisibilityChecker, txn_id: TransactionId) bool {
-        return self.aborted_txns.contains(txn_id);
-    }
-
-    /// Get commit LSN for a transaction
-    pub fn getCommitLSN(self: *const VisibilityChecker, txn_id: TransactionId) ?LSN {
-        return self.committed_txns.get(txn_id);
-    }
-
-    /// Check if a version is visible to a transaction
-    pub fn isVisible(
-        self: *const VisibilityChecker,
-        version: *const Version,
-        reader_txn_id: TransactionId,
-        reader_snapshot_lsn: LSN,
-        isolation: IsolationLevel,
-    ) bool {
-        // Version created by same transaction is always visible
-        if (version.created_by == reader_txn_id) {
-            return !version.isDeleted() or version.deleted_by != reader_txn_id;
-        }
-
-        // Check if creator is committed
-        const creator_committed = self.isCommitted(version.created_by);
-        if (!creator_committed) {
-            return false; // Uncommitted version not visible
-        }
-
-        // For repeatable read, check snapshot
-        if (isolation == .repeatable_read or isolation == .serializable) {
-            const creator_commit_lsn = self.getCommitLSN(version.created_by) orelse return false;
-            if (creator_commit_lsn > reader_snapshot_lsn) {
-                return false; // Created after snapshot
-            }
-        }
-
-        // Check if deleted
-        if (version.isDeleted()) {
-            // Deleted by same transaction - not visible
-            if (version.deleted_by == reader_txn_id) {
-                return false;
-            }
-
-            // Check if deleter is committed
-            if (self.isCommitted(version.deleted_by)) {
-                // For repeatable read, check snapshot
-                if (isolation == .repeatable_read or isolation == .serializable) {
-                    const deleter_commit_lsn = self.getCommitLSN(version.deleted_by) orelse return true;
-                    if (deleter_commit_lsn <= reader_snapshot_lsn) {
-                        return false; // Deleted before snapshot
-                    }
-                    return true; // Deleted after snapshot - still visible
-                }
-                return false; // Read committed sees deletion
-            }
-            // Deleter not committed - version still visible
-            return true;
-        }
-
-        return true;
-    }
-
-    /// Find visible version in a chain
-    pub fn findVisibleVersion(
-        self: *const VisibilityChecker,
-        chain: *const VersionChain,
-        reader_txn_id: TransactionId,
-        reader_snapshot_lsn: LSN,
-        isolation: IsolationLevel,
-    ) ?*Version {
-        var current = chain.head;
-        while (current) |version| {
-            if (self.isVisible(version, reader_txn_id, reader_snapshot_lsn, isolation)) {
-                return version;
-            }
-            current = version.prev;
-        }
-        return null;
-    }
-};
-
-/// MVCC version store - maps keys to version chains
-pub const MVCCStore = struct {
-    allocator: std.mem.Allocator,
-    /// Key to version chain mapping
-    chains: std.StringHashMap(VersionChain),
-    /// Visibility checker
-    visibility: VisibilityChecker,
-    /// Statistics
-    total_versions: u64,
-    gc_runs: u64,
-    versions_collected: u64,
-
-    pub fn init(allocator: std.mem.Allocator) MVCCStore {
-        return .{
-            .allocator = allocator,
-            .chains = std.StringHashMap(VersionChain).init(allocator),
-            .visibility = VisibilityChecker.init(allocator),
-            .total_versions = 0,
-            .gc_runs = 0,
-            .versions_collected = 0,
-        };
-    }
-
-    pub fn deinit(self: *MVCCStore) void {
-        var it = self.chains.iterator();
-        while (it.next()) |entry| {
-            // Free the key
-            self.allocator.free(entry.key_ptr.*);
-            // Deinit the chain
-            entry.value_ptr.deinit();
-        }
-        self.chains.deinit();
-        self.visibility.deinit();
-    }
-
-    /// Put a new version
-    pub fn put(
-        self: *MVCCStore,
-        key: []const u8,
-        value: []const u8,
-        txn_id: TransactionId,
-        lsn: LSN,
-    ) !void {
-        const result = self.chains.getOrPut(key) catch {
-            return errors.Error.OutOfSpace;
-        };
-
-        if (!result.found_existing) {
-            // New key - need to copy it
-            result.key_ptr.* = self.allocator.dupe(u8, key) catch {
-                return errors.Error.OutOfSpace;
-            };
-            result.value_ptr.* = VersionChain.init(self.allocator);
-        }
-
-        _ = result.value_ptr.addVersion(txn_id, lsn, value) catch {
-            return errors.Error.OutOfSpace;
-        };
-        self.total_versions += 1;
-    }
-
-    /// Delete a key (mark current version as deleted)
-    pub fn delete(
-        self: *MVCCStore,
-        key: []const u8,
-        txn_id: TransactionId,
-        lsn: LSN,
-    ) bool {
-        if (self.chains.getPtr(key)) |chain| {
-            _ = chain.deleteHead(txn_id, lsn);
-            return true;
-        }
-        return false;
-    }
-
-    /// Get visible value for a key
-    pub fn get(
-        self: *const MVCCStore,
-        key: []const u8,
-        txn_id: TransactionId,
-        snapshot_lsn: LSN,
-        isolation: IsolationLevel,
-    ) ?[]const u8 {
-        if (self.chains.getPtr(key)) |chain| {
-            if (self.visibility.findVisibleVersion(chain, txn_id, snapshot_lsn, isolation)) |version| {
-                return version.value;
-            }
-        }
-        return null;
-    }
-
-    /// Mark transaction as committed
-    pub fn commitTransaction(self: *MVCCStore, txn_id: TransactionId, commit_lsn: LSN) !void {
-        try self.visibility.markCommitted(txn_id, commit_lsn);
-    }
-
-    /// Mark transaction as aborted
-    pub fn abortTransaction(self: *MVCCStore, txn_id: TransactionId) !void {
-        try self.visibility.markAborted(txn_id);
+    /// Check if key exists (any visible version)
+    pub fn exists(self: *const VersionChain, read_ts: u64) bool {
+        return self.getVisible(read_ts) != null;
     }
 
     /// Garbage collect old versions
-    /// Removes versions that are no longer visible to any active transaction
-    pub fn gc(self: *MVCCStore, oldest_active_lsn: LSN) u64 {
-        var collected: u64 = 0;
+    pub fn gc(self: *VersionChain, oldest_active_ts: u64) void {
+        // Keep versions that might be visible to any active transaction
+        var prev: ?*Version = null;
+        var current = self.head;
 
-        var it = self.chains.iterator();
-        while (it.next()) |entry| {
-            const chain = entry.value_ptr;
-            collected += self.gcChain(chain, oldest_active_lsn);
-        }
+        while (current) |v| {
+            const next = v.next;
 
-        self.gc_runs += 1;
-        self.versions_collected += collected;
-        self.total_versions -= collected;
-        return collected;
-    }
-
-    fn gcChain(self: *MVCCStore, chain: *VersionChain, oldest_active_lsn: LSN) u64 {
-        var collected: u64 = 0;
-        var prev_ptr: ?*?*Version = null;
-        var current = chain.head;
-
-        while (current) |version| {
-            const next = version.prev;
-
-            // Can collect if:
-            // 1. Version is deleted AND
-            // 2. Delete was committed before oldest active transaction AND
-            // 3. There's a newer committed version
-            const can_collect = version.isDeleted() and
-                version.deleted_lsn < oldest_active_lsn and
-                self.visibility.isCommitted(version.deleted_by);
-
-            if (can_collect) {
-                // Unlink from chain
-                if (prev_ptr) |pp| {
-                    pp.* = next;
-                } else {
-                    chain.head = next;
+            // If this version's end_ts is before oldest active, and there's a newer version,
+            // this version can be removed
+            if (v.end_ts < oldest_active_ts and prev != null) {
+                if (prev) |p| {
+                    p.next = next;
                 }
-                version.deinit(self.allocator);
-                chain.version_count -= 1;
-                collected += 1;
+                self.allocator.free(v.value);
+                self.allocator.destroy(v);
             } else {
-                prev_ptr = &current.?.prev;
+                prev = v;
             }
 
             current = next;
         }
-
-        return collected;
     }
 
-    /// Get statistics
-    pub fn getStats(self: *const MVCCStore) MVCCStats {
-        return .{
-            .total_keys = self.chains.count(),
-            .total_versions = self.total_versions,
-            .gc_runs = self.gc_runs,
-            .versions_collected = self.versions_collected,
-        };
+    /// Get version count (for stats/debugging)
+    pub fn versionCount(self: *const VersionChain) usize {
+        var count: usize = 0;
+        var current = self.head;
+        while (current) |v| {
+            count += 1;
+            current = v.next;
+        }
+        return count;
     }
 };
 
-/// MVCC statistics
-pub const MVCCStats = struct {
-    total_keys: usize,
-    total_versions: u64,
-    gc_runs: u64,
-    versions_collected: u64,
+/// MVCC store - manages version chains for all keys
+pub const MVCCStore = struct {
+    /// Key to version chain mapping
+    chains: std.StringHashMap(*VersionChain),
+    /// Allocator
+    allocator: std.mem.Allocator,
+    /// Current timestamp
+    current_ts: u64,
+    /// Mutex for thread safety
+    mutex: std.Thread.Mutex,
+
+    /// Initialize MVCC store
+    pub fn init(allocator: std.mem.Allocator) MVCCStore {
+        return .{
+            .chains = std.StringHashMap(*VersionChain).init(allocator),
+            .allocator = allocator,
+            .current_ts = 1,
+            .mutex = .{},
+        };
+    }
+
+    /// Free resources
+    pub fn deinit(self: *MVCCStore) void {
+        var iter = self.chains.valueIterator();
+        while (iter.next()) |chain_ptr| {
+            chain_ptr.*.deinit();
+            self.allocator.destroy(chain_ptr.*);
+        }
+        self.chains.deinit();
+    }
+
+    /// Get or create version chain for key
+    fn getOrCreateChain(self: *MVCCStore, key: Key) !*VersionChain {
+        if (self.chains.get(key)) |chain| {
+            return chain;
+        }
+
+        const chain = try self.allocator.create(VersionChain);
+        chain.* = try VersionChain.init(self.allocator, key);
+        try self.chains.put(chain.key, chain);
+        return chain;
+    }
+
+    /// Put a value (creates new version)
+    pub fn put(self: *MVCCStore, txn_id: TransactionId, key: Key, value: Value) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const ts = self.current_ts;
+        self.current_ts += 1;
+
+        const chain = try self.getOrCreateChain(key);
+        try chain.addVersion(txn_id, ts, value);
+
+        return ts;
+    }
+
+    /// Get a value visible to timestamp
+    pub fn get(self: *MVCCStore, key: Key, read_ts: u64) ?Value {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const chain = self.chains.get(key) orelse return null;
+        return chain.getVisible(read_ts);
+    }
+
+    /// Delete a key (marks current version as deleted)
+    pub fn delete(self: *MVCCStore, txn_id: TransactionId, key: Key) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const ts = self.current_ts;
+        self.current_ts += 1;
+
+        if (self.chains.get(key)) |chain| {
+            chain.markDeleted(txn_id, ts);
+        }
+
+        return ts;
+    }
+
+    /// Check if key exists at timestamp
+    pub fn exists(self: *MVCCStore, key: Key, read_ts: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const chain = self.chains.get(key) orelse return false;
+        return chain.exists(read_ts);
+    }
+
+    /// Garbage collect old versions
+    pub fn gc(self: *MVCCStore, oldest_active_ts: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var iter = self.chains.valueIterator();
+        while (iter.next()) |chain_ptr| {
+            chain_ptr.*.gc(oldest_active_ts);
+        }
+    }
+
+    /// Get current timestamp
+    pub fn getTimestamp(self: *MVCCStore) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.current_ts;
+    }
+
+    /// Get key count
+    pub fn keyCount(self: *const MVCCStore) usize {
+        return self.chains.count();
+    }
 };
 
 // Tests
 
-test "Version create and delete" {
-    const allocator = std.testing.allocator;
+test "Version visibility" {
+    const v = Version{
+        .created_by = 1,
+        .deleted_by = INVALID_TXN_ID,
+        .begin_ts = 5,
+        .end_ts = 10,
+        .value = undefined,
+        .next = null,
+    };
 
-    const version = try Version.init(allocator, 1, 100, "test value");
-    defer version.deinit(allocator);
-
-    try std.testing.expectEqual(@as(TransactionId, 1), version.created_by);
-    try std.testing.expectEqual(@as(LSN, 100), version.created_lsn);
-    try std.testing.expectEqualStrings("test value", version.value);
-    try std.testing.expect(!version.isDeleted());
-
-    version.markDeleted(2, 200);
-    try std.testing.expect(version.isDeleted());
-    try std.testing.expectEqual(@as(TransactionId, 2), version.deleted_by);
+    try std.testing.expect(!v.isVisibleTo(4));
+    try std.testing.expect(v.isVisibleTo(5));
+    try std.testing.expect(v.isVisibleTo(9));
+    try std.testing.expect(!v.isVisibleTo(10));
+    try std.testing.expect(!v.isVisibleTo(15));
 }
 
-test "VersionChain operations" {
+test "VersionChain basic" {
     const allocator = std.testing.allocator;
 
-    var chain = VersionChain.init(allocator);
+    var chain = try VersionChain.init(allocator, "key1");
     defer chain.deinit();
 
-    _ = try chain.addVersion(1, 100, "v1");
-    _ = try chain.addVersion(2, 200, "v2");
-    _ = try chain.addVersion(3, 300, "v3");
+    // Add version
+    try chain.addVersion(1, 5, "value1");
+    try std.testing.expectEqual(@as(usize, 1), chain.versionCount());
 
-    try std.testing.expectEqual(@as(u32, 3), chain.getVersionCount());
+    // Get visible
+    const v = chain.getVisible(5);
+    try std.testing.expect(v != null);
+    try std.testing.expectEqualStrings("value1", v.?);
 
-    const head = chain.getHead().?;
-    try std.testing.expectEqualStrings("v3", head.value);
-    try std.testing.expectEqualStrings("v2", head.prev.?.value);
+    // Not visible before creation
+    try std.testing.expectEqual(@as(?Value, null), chain.getVisible(4));
 }
 
-test "VisibilityChecker committed transactions" {
+test "VersionChain multiple versions" {
     const allocator = std.testing.allocator;
 
-    var checker = VisibilityChecker.init(allocator);
-    defer checker.deinit();
+    var chain = try VersionChain.init(allocator, "key1");
+    defer chain.deinit();
 
-    try checker.markCommitted(1, 100);
-    try checker.markCommitted(2, 200);
-    try checker.markAborted(3);
+    // Add first version at ts=1
+    try chain.addVersion(1, 1, "v1");
 
-    try std.testing.expect(checker.isCommitted(1));
-    try std.testing.expect(checker.isCommitted(2));
-    try std.testing.expect(!checker.isCommitted(3));
-    try std.testing.expect(checker.isAborted(3));
-    try std.testing.expectEqual(@as(LSN, 100), checker.getCommitLSN(1).?);
+    // Add second version at ts=5 (deletes first)
+    try chain.addVersion(2, 5, "v2");
+
+    try std.testing.expectEqual(@as(usize, 2), chain.versionCount());
+
+    // ts=1 sees v1
+    try std.testing.expectEqualStrings("v1", chain.getVisible(1).?);
+
+    // ts=5 sees v2
+    try std.testing.expectEqualStrings("v2", chain.getVisible(5).?);
+
+    // ts=3 sees v1
+    try std.testing.expectEqualStrings("v1", chain.getVisible(3).?);
 }
 
-test "VisibilityChecker version visibility" {
+test "VersionChain delete" {
     const allocator = std.testing.allocator;
 
-    var checker = VisibilityChecker.init(allocator);
-    defer checker.deinit();
+    var chain = try VersionChain.init(allocator, "key1");
+    defer chain.deinit();
 
-    // Commit transaction 1 at LSN 100
-    try checker.markCommitted(1, 100);
+    try chain.addVersion(1, 1, "value");
+    chain.markDeleted(2, 5);
 
-    const version = try Version.init(allocator, 1, 50, "value");
-    defer version.deinit(allocator);
+    // Visible before delete
+    try std.testing.expect(chain.exists(3));
 
-    // Reader in txn 2, snapshot at LSN 150 - should see committed version
-    try std.testing.expect(checker.isVisible(version, 2, 150, .read_committed));
-    try std.testing.expect(checker.isVisible(version, 2, 150, .repeatable_read));
-
-    // Reader with snapshot before commit (LSN 80) - repeatable read should NOT see it
-    try std.testing.expect(checker.isVisible(version, 2, 80, .read_committed)); // RC always sees committed
-    try std.testing.expect(!checker.isVisible(version, 2, 80, .repeatable_read)); // RR respects snapshot
+    // Not visible after delete
+    try std.testing.expect(!chain.exists(5));
 }
 
 test "MVCCStore put and get" {
@@ -495,13 +343,37 @@ test "MVCCStore put and get" {
     var store = MVCCStore.init(allocator);
     defer store.deinit();
 
-    // Transaction 1 writes
-    try store.put("key1", "value1", 1, 10);
-    try store.commitTransaction(1, 20);
+    const ts1 = try store.put(1, "key1", "value1");
+    const ts2 = try store.put(1, "key2", "value2");
 
-    // Transaction 2 reads
-    const value = store.get("key1", 2, 50, .read_committed);
-    try std.testing.expectEqualStrings("value1", value.?);
+    try std.testing.expect(ts2 > ts1);
+
+    const v1 = store.get("key1", ts1);
+    try std.testing.expect(v1 != null);
+    try std.testing.expectEqualStrings("value1", v1.?);
+
+    const v2 = store.get("key2", ts2);
+    try std.testing.expect(v2 != null);
+    try std.testing.expectEqualStrings("value2", v2.?);
+
+    // key2 not visible at ts1
+    try std.testing.expectEqual(@as(?Value, null), store.get("key2", ts1));
+}
+
+test "MVCCStore update" {
+    const allocator = std.testing.allocator;
+
+    var store = MVCCStore.init(allocator);
+    defer store.deinit();
+
+    const ts1 = try store.put(1, "key", "v1");
+    const ts2 = try store.put(2, "key", "v2");
+
+    // Old timestamp sees old value
+    try std.testing.expectEqualStrings("v1", store.get("key", ts1).?);
+
+    // New timestamp sees new value
+    try std.testing.expectEqualStrings("v2", store.get("key", ts2).?);
 }
 
 test "MVCCStore delete" {
@@ -510,41 +382,14 @@ test "MVCCStore delete" {
     var store = MVCCStore.init(allocator);
     defer store.deinit();
 
-    // Write and commit
-    try store.put("key1", "value1", 1, 10);
-    try store.commitTransaction(1, 20);
+    const ts1 = try store.put(1, "key", "value");
+    const ts2 = try store.delete(2, "key");
 
-    // Delete and commit
-    _ = store.delete("key1", 2, 30);
-    try store.commitTransaction(2, 40);
+    // Before delete: exists
+    try std.testing.expect(store.exists("key", ts1));
 
-    // Should not be visible
-    const value = store.get("key1", 3, 50, .read_committed);
-    try std.testing.expect(value == null);
-}
-
-test "MVCCStore snapshot isolation" {
-    const allocator = std.testing.allocator;
-
-    var store = MVCCStore.init(allocator);
-    defer store.deinit();
-
-    // Transaction 1 writes v1
-    try store.put("key", "v1", 1, 10);
-    try store.commitTransaction(1, 20);
-
-    // Transaction 2 starts with snapshot at LSN 25
-    // Transaction 3 writes v2 and commits at LSN 30
-    try store.put("key", "v2", 3, 25);
-    try store.commitTransaction(3, 30);
-
-    // Transaction 2 with repeatable read should still see v1 (committed before snapshot)
-    const value_rr = store.get("key", 2, 25, .repeatable_read);
-    try std.testing.expectEqualStrings("v1", value_rr.?);
-
-    // Read committed should see v2
-    const value_rc = store.get("key", 2, 25, .read_committed);
-    try std.testing.expectEqualStrings("v2", value_rc.?);
+    // After delete: gone
+    try std.testing.expect(!store.exists("key", ts2));
 }
 
 test "MVCCStore gc" {
@@ -553,35 +398,16 @@ test "MVCCStore gc" {
     var store = MVCCStore.init(allocator);
     defer store.deinit();
 
-    // Create multiple versions
-    try store.put("key", "v1", 1, 10);
-    try store.commitTransaction(1, 15);
+    _ = try store.put(1, "key", "v1");
+    _ = try store.put(2, "key", "v2");
+    _ = try store.put(3, "key", "v3");
 
-    try store.put("key", "v2", 2, 20);
-    try store.commitTransaction(2, 25);
+    const chain = store.chains.get("key").?;
+    try std.testing.expectEqual(@as(usize, 3), chain.versionCount());
 
-    // Delete v2
-    _ = store.delete("key", 3, 30);
-    try store.commitTransaction(3, 35);
+    // GC with oldest_active_ts = 10 should keep some versions
+    store.gc(10);
 
-    const stats = store.getStats();
-    try std.testing.expectEqual(@as(u64, 2), stats.total_versions);
-
-    // GC with oldest active LSN = 100 (after all commits)
-    const collected = store.gc(100);
-
-    // Should have collected the deleted version
-    try std.testing.expect(collected >= 1);
-}
-
-test "MVCCStats" {
-    const stats = MVCCStats{
-        .total_keys = 10,
-        .total_versions = 25,
-        .gc_runs = 3,
-        .versions_collected = 5,
-    };
-
-    try std.testing.expectEqual(@as(usize, 10), stats.total_keys);
-    try std.testing.expectEqual(@as(u64, 25), stats.total_versions);
+    // Latest version should still be there
+    try std.testing.expect(store.get("key", 100) != null);
 }

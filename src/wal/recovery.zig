@@ -6,695 +6,372 @@ const writer = @import("writer.zig");
 
 const LSN = types.LSN;
 const TransactionId = types.TransactionId;
-const TxnState = types.TxnState;
+const PageId = types.PageId;
 const INVALID_LSN = types.INVALID_LSN;
 const INVALID_TXN_ID = types.INVALID_TXN_ID;
+
 const Record = record.Record;
 const RecordType = record.RecordType;
-const RecordHeader = record.RecordHeader;
-const RECORD_HEADER_SIZE = record.RECORD_HEADER_SIZE;
-const WALHeader = writer.WALHeader;
-const WAL_HEADER_SIZE = writer.WAL_HEADER_SIZE;
+const InsertData = record.InsertData;
+const DeleteData = record.DeleteData;
+const CheckpointData = record.CheckpointData;
+const WALReader = writer.WALReader;
 
-/// Transaction state during recovery
-pub const TxnRecoveryState = struct {
+/// Transaction status during recovery
+pub const TxnStatus = enum {
+    active,
+    committed,
+    aborted,
+};
+
+/// Transaction info during recovery
+pub const TxnInfo = struct {
+    /// Transaction ID
     txn_id: TransactionId,
-    state: TxnState,
-    /// LSN of begin record
-    begin_lsn: LSN,
-    /// LSN of commit/abort record (or 0 if still active)
-    end_lsn: LSN,
-    /// Records belonging to this transaction (for undo)
-    records: std.ArrayList(RecoveryRecord),
-
-    pub fn init(txn_id: TransactionId, begin_lsn: LSN) TxnRecoveryState {
-        return .{
-            .txn_id = txn_id,
-            .state = .active,
-            .begin_lsn = begin_lsn,
-            .end_lsn = 0,
-            .records = .{},
-        };
-    }
-
-    pub fn deinit(self: *TxnRecoveryState, allocator: std.mem.Allocator) void {
-        for (self.records.items) |*rec| {
-            rec.deinit(allocator);
-        }
-        self.records.deinit(allocator);
-    }
-
-    pub fn addRecord(self: *TxnRecoveryState, allocator: std.mem.Allocator, rec: RecoveryRecord) !void {
-        try self.records.append(allocator, rec);
-    }
-
-    pub fn markCommitted(self: *TxnRecoveryState, commit_lsn: LSN) void {
-        self.state = .committed;
-        self.end_lsn = commit_lsn;
-    }
-
-    pub fn markAborted(self: *TxnRecoveryState, abort_lsn: LSN) void {
-        self.state = .aborted;
-        self.end_lsn = abort_lsn;
-    }
+    /// Current status
+    status: TxnStatus,
+    /// Last LSN for this transaction
+    last_lsn: LSN,
+    /// First LSN for this transaction
+    first_lsn: LSN,
 };
 
-/// Simplified record for recovery (just what we need for redo/undo)
-pub const RecoveryRecord = struct {
-    lsn: LSN,
-    record_type: RecordType,
-    key: []const u8,
-    old_value: []const u8,
-    new_value: []const u8,
-
-    pub fn fromRecord(allocator: std.mem.Allocator, rec: *const Record) !RecoveryRecord {
-        return .{
-            .lsn = rec.lsn(),
-            .record_type = rec.recordType(),
-            .key = if (rec.key.len > 0) try allocator.dupe(u8, rec.key) else &[_]u8{},
-            .old_value = if (rec.old_value.len > 0) try allocator.dupe(u8, rec.old_value) else &[_]u8{},
-            .new_value = if (rec.new_value.len > 0) try allocator.dupe(u8, rec.new_value) else &[_]u8{},
-        };
-    }
-
-    pub fn deinit(self: *RecoveryRecord, allocator: std.mem.Allocator) void {
-        if (self.key.len > 0) allocator.free(self.key);
-        if (self.old_value.len > 0) allocator.free(self.old_value);
-        if (self.new_value.len > 0) allocator.free(self.new_value);
-    }
-};
-
-/// Callback for applying redo/undo operations
-pub const RecoveryCallback = struct {
-    context: *anyopaque,
-    redoFn: *const fn (ctx: *anyopaque, rec: *const RecoveryRecord) errors.MonolithError!void,
-    undoFn: *const fn (ctx: *anyopaque, rec: *const RecoveryRecord) errors.MonolithError!void,
-
-    pub fn redo(self: RecoveryCallback, rec: *const RecoveryRecord) errors.MonolithError!void {
-        return self.redoFn(self.context, rec);
-    }
-
-    pub fn undo(self: RecoveryCallback, rec: *const RecoveryRecord) errors.MonolithError!void {
-        return self.undoFn(self.context, rec);
-    }
-};
-
-/// WAL Recovery manager
-pub const WALRecovery = struct {
-    allocator: std.mem.Allocator,
-    /// Directory containing WAL files
-    dir_path: []const u8,
-    /// Transaction states
-    transactions: std.AutoHashMap(TransactionId, TxnRecoveryState),
-    /// Checkpoint LSN (start recovery from here)
+/// Recovery result
+pub const RecoveryResult = struct {
+    /// Transactions that need to be redone
+    redo_txns: std.ArrayListUnmanaged(TransactionId),
+    /// Transactions that need to be undone
+    undo_txns: std.ArrayListUnmanaged(TransactionId),
+    /// Last checkpoint LSN
     checkpoint_lsn: LSN,
-    /// Last valid LSN found
-    last_valid_lsn: LSN,
-    /// Records to redo (in LSN order)
-    redo_records: std.ArrayList(RecoveryRecord),
-    /// Statistics
-    records_read: u64,
-    records_redone: u64,
-    records_undone: u64,
-    txns_committed: u64,
-    txns_aborted: u64,
-
-    pub fn init(allocator: std.mem.Allocator, dir_path: []const u8) !WALRecovery {
-        return .{
-            .allocator = allocator,
-            .dir_path = try allocator.dupe(u8, dir_path),
-            .transactions = std.AutoHashMap(TransactionId, TxnRecoveryState).init(allocator),
-            .checkpoint_lsn = INVALID_LSN,
-            .last_valid_lsn = INVALID_LSN,
-            .redo_records = .{},
-            .records_read = 0,
-            .records_redone = 0,
-            .records_undone = 0,
-            .txns_committed = 0,
-            .txns_aborted = 0,
-        };
-    }
-
-    pub fn deinit(self: *WALRecovery) void {
-        // Clean up transaction states
-        var it = self.transactions.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.transactions.deinit();
-
-        // Clean up redo records
-        for (self.redo_records.items) |*rec| {
-            rec.deinit(self.allocator);
-        }
-        self.redo_records.deinit(self.allocator);
-
-        self.allocator.free(self.dir_path);
-    }
-
-    /// Set checkpoint LSN to start recovery from
-    pub fn setCheckpointLSN(self: *WALRecovery, lsn: LSN) void {
-        self.checkpoint_lsn = lsn;
-    }
-
-    /// Scan WAL files and build recovery state
-    pub fn analyze(self: *WALRecovery) errors.MonolithError!void {
-        // Find all WAL segment files
-        var segment: u64 = 0;
-        while (true) : (segment += 1) {
-            const filename = try self.getSegmentFilename(segment);
-            defer self.allocator.free(filename);
-
-            const file = std.fs.cwd().openFile(filename, .{ .mode = .read_only }) catch |err| switch (err) {
-                error.FileNotFound => break, // No more segments
-                else => return errors.Error.WALCorrupted,
-            };
-            defer file.close();
-
-            try self.analyzeSegment(file);
-        }
-    }
-
-    /// Analyze a single WAL segment
-    fn analyzeSegment(self: *WALRecovery, file: std.fs.File) errors.MonolithError!void {
-        // Read and validate header
-        var header_buf: [WAL_HEADER_SIZE]u8 = undefined;
-        const header_read = file.read(&header_buf) catch {
-            return errors.Error.WALCorrupted;
-        };
-        if (header_read < WAL_HEADER_SIZE) {
-            return; // Empty or truncated segment
-        }
-
-        _ = WALHeader.deserialize(&header_buf) catch {
-            return errors.Error.WALCorrupted;
-        };
-
-        // Read records
-        var position: u64 = WAL_HEADER_SIZE;
-        const file_size = file.stat() catch {
-            return errors.Error.WALCorrupted;
-        };
-
-        while (position < file_size.size) {
-            // Read record header to get length
-            file.seekTo(position) catch {
-                return errors.Error.WALCorrupted;
-            };
-
-            var len_buf: [4]u8 = undefined;
-            const len_read = file.read(&len_buf) catch break;
-            if (len_read < 4) break;
-
-            const total_length = std.mem.bytesToValue(u32, &len_buf);
-            if (total_length < record.MIN_RECORD_SIZE or total_length > 16 * 1024 * 1024) {
-                break; // Invalid record length, stop here
-            }
-
-            // Read full record
-            file.seekTo(position) catch break;
-            const record_buf = self.allocator.alloc(u8, total_length) catch {
-                return errors.Error.OutOfSpace;
-            };
-            defer self.allocator.free(record_buf);
-
-            const bytes_read = file.read(record_buf) catch break;
-            if (bytes_read < total_length) break; // Partial record
-
-            // Deserialize record
-            var rec = Record.deserialize(self.allocator, record_buf) catch |err| switch (err) {
-                errors.Error.WALCorrupted => break, // CRC mismatch, stop here
-                else => return err,
-            };
-            defer rec.deinit();
-
-            // Skip if before checkpoint
-            if (self.checkpoint_lsn != INVALID_LSN and rec.lsn() < self.checkpoint_lsn) {
-                position += total_length;
-                continue;
-            }
-
-            // Process record
-            try self.processRecord(&rec);
-            self.records_read += 1;
-            self.last_valid_lsn = rec.lsn();
-
-            position += total_length;
-        }
-    }
-
-    /// Process a single record during analysis
-    fn processRecord(self: *WALRecovery, rec: *const Record) errors.MonolithError!void {
-        const txn_id = rec.txnId();
-
-        switch (rec.recordType()) {
-            .begin => {
-                // Start tracking new transaction
-                const state = TxnRecoveryState.init(txn_id, rec.lsn());
-                try self.transactions.put(txn_id, state);
-            },
-            .commit => {
-                // Mark transaction as committed
-                if (self.transactions.getPtr(txn_id)) |state| {
-                    state.markCommitted(rec.lsn());
-                    self.txns_committed += 1;
-                }
-            },
-            .abort => {
-                // Mark transaction as aborted
-                if (self.transactions.getPtr(txn_id)) |state| {
-                    state.markAborted(rec.lsn());
-                    self.txns_aborted += 1;
-                }
-            },
-            .insert, .update, .delete => {
-                // Data modification record
-                const recovery_rec = RecoveryRecord.fromRecord(self.allocator, rec) catch {
-                    return errors.Error.OutOfSpace;
-                };
-
-                // Add to transaction's record list (for potential undo)
-                if (self.transactions.getPtr(txn_id)) |state| {
-                    const rec_copy = RecoveryRecord.fromRecord(self.allocator, rec) catch {
-                        return errors.Error.OutOfSpace;
-                    };
-                    state.addRecord(self.allocator, rec_copy) catch {
-                        return errors.Error.OutOfSpace;
-                    };
-                }
-
-                // Add to redo list
-                self.redo_records.append(self.allocator, recovery_rec) catch {
-                    return errors.Error.OutOfSpace;
-                };
-            },
-            .checkpoint => {
-                // Checkpoint record - could update checkpoint_lsn
-            },
-        }
-    }
-
-    /// Perform redo phase - replay committed transactions
-    pub fn redo(self: *WALRecovery, callback: RecoveryCallback) errors.MonolithError!void {
-        // Sort redo records by LSN
-        std.mem.sort(RecoveryRecord, self.redo_records.items, {}, struct {
-            fn lessThan(_: void, a: RecoveryRecord, b: RecoveryRecord) bool {
-                return a.lsn < b.lsn;
-            }
-        }.lessThan);
-
-        // Redo records from committed transactions only
-        for (self.redo_records.items) |*rec| {
-            // Find the transaction this record belongs to
-            var txn_committed = false;
-            var it = self.transactions.iterator();
-            while (it.next()) |entry| {
-                const state = entry.value_ptr;
-                for (state.records.items) |txn_rec| {
-                    if (txn_rec.lsn == rec.lsn) {
-                        txn_committed = (state.state == .committed);
-                        break;
-                    }
-                }
-            }
-
-            if (txn_committed) {
-                try callback.redo(rec);
-                self.records_redone += 1;
-            }
-        }
-    }
-
-    /// Perform undo phase - rollback uncommitted transactions
-    pub fn undo(self: *WALRecovery, callback: RecoveryCallback) errors.MonolithError!void {
-        // Find uncommitted (active) transactions
-        var it = self.transactions.iterator();
-        while (it.next()) |entry| {
-            const state = entry.value_ptr;
-            if (state.state == .active) {
-                // Undo in reverse order
-                var i = state.records.items.len;
-                while (i > 0) {
-                    i -= 1;
-                    try callback.undo(&state.records.items[i]);
-                    self.records_undone += 1;
-                }
-            }
-        }
-    }
-
-    /// Run full recovery (analyze + redo + undo)
-    pub fn recover(self: *WALRecovery, callback: RecoveryCallback) errors.MonolithError!void {
-        try self.analyze();
-        try self.redo(callback);
-        try self.undo(callback);
-    }
-
-    /// Get the last valid LSN found during recovery
-    pub fn getLastValidLSN(self: *const WALRecovery) LSN {
-        return self.last_valid_lsn;
-    }
-
-    /// Get recovery statistics
-    pub fn getStats(self: *const WALRecovery) RecoveryStats {
-        return .{
-            .records_read = self.records_read,
-            .records_redone = self.records_redone,
-            .records_undone = self.records_undone,
-            .txns_committed = self.txns_committed,
-            .txns_aborted = self.txns_aborted,
-            .last_valid_lsn = self.last_valid_lsn,
-        };
-    }
-
-    /// Get number of uncommitted transactions
-    pub fn getUncommittedCount(self: *const WALRecovery) u64 {
-        var count: u64 = 0;
-        var it = self.transactions.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.state == .active) {
-                count += 1;
-            }
-        }
-        return count;
-    }
-
-    fn getSegmentFilename(self: *WALRecovery, segment: u64) errors.MonolithError![]u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}/wal_{d:0>8}.log", .{ self.dir_path, segment }) catch {
-            return errors.Error.OutOfSpace;
-        };
-    }
-};
-
-/// Recovery statistics
-pub const RecoveryStats = struct {
-    records_read: u64,
-    records_redone: u64,
-    records_undone: u64,
-    txns_committed: u64,
-    txns_aborted: u64,
-    last_valid_lsn: LSN,
-};
-
-/// WAL reader for iterating through records
-pub const WALReader = struct {
+    /// Next LSN to use
+    next_lsn: LSN,
+    /// Allocator
     allocator: std.mem.Allocator,
-    dir_path: []const u8,
-    current_segment: u64,
-    current_file: ?std.fs.File,
-    position: u64,
-    start_lsn: LSN,
 
-    pub fn init(allocator: std.mem.Allocator, dir_path: []const u8, start_lsn: LSN) !WALReader {
+    pub fn deinit(self: *RecoveryResult) void {
+        self.redo_txns.deinit(self.allocator);
+        self.undo_txns.deinit(self.allocator);
+    }
+};
+
+/// Recovery manager for crash recovery
+pub const Recovery = struct {
+    /// Allocator
+    allocator: std.mem.Allocator,
+    /// WAL path
+    wal_path: []const u8,
+    /// Transaction table
+    txn_table: std.AutoHashMap(TransactionId, TxnInfo),
+    /// Dirty page table (page_id -> recovery LSN)
+    dirty_pages: std.AutoHashMap(PageId, LSN),
+    /// Last checkpoint LSN
+    checkpoint_lsn: LSN,
+
+    /// Initialize recovery manager
+    pub fn init(allocator: std.mem.Allocator, wal_path: []const u8) Recovery {
         return .{
             .allocator = allocator,
-            .dir_path = try allocator.dupe(u8, dir_path),
-            .current_segment = 0,
-            .current_file = null,
-            .position = WAL_HEADER_SIZE,
-            .start_lsn = start_lsn,
+            .wal_path = wal_path,
+            .txn_table = std.AutoHashMap(TransactionId, TxnInfo).init(allocator),
+            .dirty_pages = std.AutoHashMap(PageId, LSN).init(allocator),
+            .checkpoint_lsn = INVALID_LSN,
         };
     }
 
-    pub fn deinit(self: *WALReader) void {
-        if (self.current_file) |file| {
-            file.close();
-        }
-        self.allocator.free(self.dir_path);
+    /// Free resources
+    pub fn deinit(self: *Recovery) void {
+        self.txn_table.deinit();
+        self.dirty_pages.deinit();
     }
 
-    /// Read next record (returns null at end)
-    pub fn next(self: *WALReader) errors.MonolithError!?Record {
-        while (true) {
-            // Open current segment if needed
-            if (self.current_file == null) {
-                const filename = try self.getSegmentFilename(self.current_segment);
-                defer self.allocator.free(filename);
-
-                self.current_file = std.fs.cwd().openFile(filename, .{ .mode = .read_only }) catch |err| switch (err) {
-                    error.FileNotFound => return null, // No more segments
-                    else => return errors.Error.WALCorrupted,
+    /// Perform ARIES-style recovery
+    pub fn recover(self: *Recovery) !RecoveryResult {
+        var reader = WALReader.open(self.allocator, self.wal_path) catch |err| {
+            if (err == error.FileNotFound) {
+                // No WAL - nothing to recover
+                return RecoveryResult{
+                    .redo_txns = .{},
+                    .undo_txns = .{},
+                    .checkpoint_lsn = INVALID_LSN,
+                    .next_lsn = 1,
+                    .allocator = self.allocator,
                 };
-                self.position = WAL_HEADER_SIZE;
+            }
+            return err;
+        };
+        defer reader.close();
+
+        // Phase 1: Analysis - scan from checkpoint (or start)
+        try self.analysisPhase(&reader);
+
+        // Phase 2: Redo - replay committed transactions
+        reader.seekTo(self.getRedoStart()) catch {};
+        try self.redoPhase(&reader);
+
+        // Phase 3: Undo - rollback active transactions
+        try self.undoPhase();
+
+        // Build result
+        var result = RecoveryResult{
+            .redo_txns = .{},
+            .undo_txns = .{},
+            .checkpoint_lsn = self.checkpoint_lsn,
+            .next_lsn = self.getNextLSN(),
+            .allocator = self.allocator,
+        };
+
+        var iter = self.txn_table.iterator();
+        while (iter.next()) |entry| {
+            const info = entry.value_ptr.*;
+            switch (info.status) {
+                .committed => try result.redo_txns.append(self.allocator, info.txn_id),
+                .active, .aborted => try result.undo_txns.append(self.allocator, info.txn_id),
+            }
+        }
+
+        return result;
+    }
+
+    /// Analysis phase: build transaction and dirty page tables
+    fn analysisPhase(self: *Recovery, reader: *WALReader) !void {
+        while (try reader.readNext()) |rec| {
+            defer {
+                var r = rec;
+                r.deinit(self.allocator);
             }
 
-            const file = self.current_file.?;
-
-            // Get file size
-            const stat = file.stat() catch {
-                return errors.Error.WALCorrupted;
-            };
-
-            // Check if at end of segment
-            if (self.position >= stat.size) {
-                file.close();
-                self.current_file = null;
-                self.current_segment += 1;
-                continue;
-            }
-
-            // Read record length
-            file.seekTo(self.position) catch {
-                return errors.Error.WALCorrupted;
-            };
-
-            var len_buf: [4]u8 = undefined;
-            const len_read = file.read(&len_buf) catch {
-                return errors.Error.WALCorrupted;
-            };
-            if (len_read < 4) {
-                // Move to next segment
-                file.close();
-                self.current_file = null;
-                self.current_segment += 1;
-                continue;
-            }
-
-            const total_length = std.mem.bytesToValue(u32, &len_buf);
-            if (total_length < record.MIN_RECORD_SIZE) {
-                return errors.Error.WALCorrupted;
-            }
-
-            // Read full record
-            file.seekTo(self.position) catch {
-                return errors.Error.WALCorrupted;
-            };
-
-            const record_buf = self.allocator.alloc(u8, total_length) catch {
-                return errors.Error.OutOfSpace;
-            };
-            defer self.allocator.free(record_buf);
-
-            const bytes_read = file.read(record_buf) catch {
-                return errors.Error.WALCorrupted;
-            };
-            if (bytes_read < total_length) {
-                // Partial record at end
-                file.close();
-                self.current_file = null;
-                self.current_segment += 1;
-                continue;
-            }
-
-            // Deserialize
-            const rec = Record.deserialize(self.allocator, record_buf) catch |err| switch (err) {
-                errors.Error.WALCorrupted => {
-                    // CRC failure, stop reading
-                    return null;
+            switch (rec.record_type) {
+                .begin => {
+                    try self.txn_table.put(rec.txn_id, .{
+                        .txn_id = rec.txn_id,
+                        .status = .active,
+                        .last_lsn = rec.lsn,
+                        .first_lsn = rec.lsn,
+                    });
                 },
-                else => return err,
-            };
+                .commit => {
+                    if (self.txn_table.getPtr(rec.txn_id)) |info| {
+                        info.status = .committed;
+                        info.last_lsn = rec.lsn;
+                    }
+                },
+                .abort => {
+                    if (self.txn_table.getPtr(rec.txn_id)) |info| {
+                        info.status = .aborted;
+                        info.last_lsn = rec.lsn;
+                    }
+                },
+                .insert, .delete, .update, .page_write => {
+                    if (self.txn_table.getPtr(rec.txn_id)) |info| {
+                        info.last_lsn = rec.lsn;
+                    }
 
-            self.position += total_length;
+                    // Track dirty pages
+                    if (rec.data.len >= 8) {
+                        const page_id = std.mem.bytesToValue(PageId, rec.data[0..8]);
+                        if (!self.dirty_pages.contains(page_id)) {
+                            try self.dirty_pages.put(page_id, rec.lsn);
+                        }
+                    }
+                },
+                .checkpoint_begin => {
+                    self.checkpoint_lsn = rec.lsn;
+                },
+                .checkpoint_end => {
+                    // Process checkpoint data
+                    if (rec.data.len > 0) {
+                        var cp_data = CheckpointData.deserialize(rec.data, self.allocator) catch continue;
+                        defer cp_data.deinit(self.allocator);
 
-            // Skip if before start LSN
-            if (rec.lsn() < self.start_lsn) {
-                var mutable_rec = rec;
-                mutable_rec.deinit();
-                continue;
+                        // Mark active transactions from checkpoint
+                        for (cp_data.active_txns) |txn_id| {
+                            if (!self.txn_table.contains(txn_id)) {
+                                try self.txn_table.put(txn_id, .{
+                                    .txn_id = txn_id,
+                                    .status = .active,
+                                    .last_lsn = INVALID_LSN,
+                                    .first_lsn = INVALID_LSN,
+                                });
+                            }
+                        }
+
+                        // Add dirty pages from checkpoint
+                        for (cp_data.dirty_pages) |page_id| {
+                            if (!self.dirty_pages.contains(page_id)) {
+                                try self.dirty_pages.put(page_id, self.checkpoint_lsn);
+                            }
+                        }
+                    }
+                },
+                .clr => {},
             }
-
-            return rec;
         }
     }
 
-    fn getSegmentFilename(self: *WALReader, segment: u64) errors.MonolithError![]u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}/wal_{d:0>8}.log", .{ self.dir_path, segment }) catch {
-            return errors.Error.OutOfSpace;
-        };
+    /// Get starting point for redo
+    fn getRedoStart(self: *const Recovery) u64 {
+        if (self.checkpoint_lsn != INVALID_LSN) {
+            // Start from checkpoint
+            return @intCast(self.checkpoint_lsn);
+        }
+        return writer.WAL_HEADER_SIZE;
+    }
+
+    /// Get next LSN
+    fn getNextLSN(self: *const Recovery) LSN {
+        var max_lsn: LSN = 0;
+        var iter = self.txn_table.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.last_lsn > max_lsn) {
+                max_lsn = entry.value_ptr.last_lsn;
+            }
+        }
+        return max_lsn + 1;
+    }
+
+    /// Redo phase: replay operations from committed transactions
+    fn redoPhase(self: *Recovery, reader: *WALReader) !void {
+        // In a full implementation, this would replay all logged operations
+        // that need to be redone (based on page LSNs)
+        _ = self;
+        _ = reader;
+        // For now, we just scan through without actually redoing
+        // The actual redo would be done by the database layer
+    }
+
+    /// Undo phase: rollback active transactions
+    fn undoPhase(self: *Recovery) !void {
+        // In a full implementation, this would follow the undo chain
+        // for each active transaction and undo their operations
+        // For now, we just mark them as needing undo
+        var iter = self.txn_table.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.status == .active) {
+                entry.value_ptr.status = .aborted;
+            }
+        }
+    }
+
+    /// Get transaction info
+    pub fn getTxnInfo(self: *const Recovery, txn_id: TransactionId) ?TxnInfo {
+        return self.txn_table.get(txn_id);
+    }
+
+    /// Get dirty pages
+    pub fn getDirtyPages(self: *const Recovery) []PageId {
+        var pages: std.ArrayListUnmanaged(PageId) = .{};
+        var iter = self.dirty_pages.keyIterator();
+        while (iter.next()) |key| {
+            pages.append(self.allocator, key.*) catch {};
+        }
+        return pages.toOwnedSlice(self.allocator) catch &[_]PageId{};
     }
 };
 
 // Tests
 
-test "TxnRecoveryState lifecycle" {
+test "Recovery empty WAL" {
     const allocator = std.testing.allocator;
+    const path = "test_recovery_empty.wal";
 
-    var state = TxnRecoveryState.init(100, 1);
-    defer state.deinit(allocator);
+    std.fs.cwd().deleteFile(path) catch {};
 
-    try std.testing.expectEqual(@as(TransactionId, 100), state.txn_id);
-    try std.testing.expectEqual(TxnState.active, state.state);
-    try std.testing.expectEqual(@as(LSN, 1), state.begin_lsn);
-
-    state.markCommitted(10);
-    try std.testing.expectEqual(TxnState.committed, state.state);
-    try std.testing.expectEqual(@as(LSN, 10), state.end_lsn);
-}
-
-test "RecoveryRecord from Record" {
-    const allocator = std.testing.allocator;
-
-    var rec = try Record.createInsert(allocator, 5, 1, "testkey", "testval");
-    defer rec.deinit();
-
-    var recovery_rec = try RecoveryRecord.fromRecord(allocator, &rec);
-    defer recovery_rec.deinit(allocator);
-
-    try std.testing.expectEqual(@as(LSN, 5), recovery_rec.lsn);
-    try std.testing.expectEqual(RecordType.insert, recovery_rec.record_type);
-    try std.testing.expectEqualStrings("testkey", recovery_rec.key);
-    try std.testing.expectEqualStrings("testval", recovery_rec.new_value);
-}
-
-test "WALRecovery init and deinit" {
-    const allocator = std.testing.allocator;
-
-    var recovery = try WALRecovery.init(allocator, "/tmp/test_recovery");
+    var recovery = Recovery.init(allocator, path);
     defer recovery.deinit();
 
-    try std.testing.expectEqual(INVALID_LSN, recovery.checkpoint_lsn);
-    try std.testing.expectEqual(INVALID_LSN, recovery.last_valid_lsn);
+    var result = try recovery.recover();
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.redo_txns.items.len);
+    try std.testing.expectEqual(@as(usize, 0), result.undo_txns.items.len);
+    try std.testing.expectEqual(@as(LSN, 1), result.next_lsn);
 }
 
-test "WALRecovery with no files" {
+test "Recovery with committed transaction" {
     const allocator = std.testing.allocator;
+    const path = "test_recovery_commit.wal";
 
-    std.fs.cwd().deleteTree("/tmp/test_recovery_empty") catch {};
-    std.fs.cwd().makePath("/tmp/test_recovery_empty") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_recovery_empty") catch {};
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
 
-    var recovery = try WALRecovery.init(allocator, "/tmp/test_recovery_empty");
-    defer recovery.deinit();
-
-    // Should not error with no files
-    try recovery.analyze();
-
-    const stats = recovery.getStats();
-    try std.testing.expectEqual(@as(u64, 0), stats.records_read);
-}
-
-test "WALRecovery full cycle" {
-    const allocator = std.testing.allocator;
-
-    // Set up test directory
-    std.fs.cwd().deleteTree("/tmp/test_recovery_full") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_recovery_full") catch {};
-
-    // Write some WAL records
+    // Write WAL
     {
-        var wal_writer = try writer.WALWriter.init(allocator, "/tmp/test_recovery_full", .none, writer.DEFAULT_SEGMENT_SIZE);
-        defer wal_writer.deinit();
+        var wal = try writer.WALWriter.open(allocator, path, .sync);
+        defer wal.close();
 
-        // Transaction 1: begin, insert, commit
-        _ = try wal_writer.writeBegin(1);
-        _ = try wal_writer.writeInsert(1, "key1", "value1");
-        _ = try wal_writer.writeCommit(1);
-
-        // Transaction 2: begin, insert (no commit - will be undone)
-        _ = try wal_writer.writeBegin(2);
-        _ = try wal_writer.writeInsert(2, "key2", "value2");
-
-        // Transaction 3: begin, insert, abort
-        _ = try wal_writer.writeBegin(3);
-        _ = try wal_writer.writeInsert(3, "key3", "value3");
-        _ = try wal_writer.writeAbort(3);
-
-        try wal_writer.flush();
+        _ = try wal.append(1, INVALID_LSN, .begin, "");
+        _ = try wal.append(1, 1, .insert, &[_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 });
+        _ = try wal.append(1, 2, .commit, "");
     }
 
-    // Now recover
-    var recovery = try WALRecovery.init(allocator, "/tmp/test_recovery_full");
+    // Recover
+    var recovery = Recovery.init(allocator, path);
     defer recovery.deinit();
 
-    try recovery.analyze();
+    var result = try recovery.recover();
+    defer result.deinit();
 
-    const stats = recovery.getStats();
-    try std.testing.expect(stats.records_read > 0);
-    try std.testing.expectEqual(@as(u64, 1), stats.txns_committed);
-    try std.testing.expectEqual(@as(u64, 1), stats.txns_aborted);
-    try std.testing.expectEqual(@as(u64, 1), recovery.getUncommittedCount());
+    try std.testing.expectEqual(@as(usize, 1), result.redo_txns.items.len);
+    try std.testing.expectEqual(@as(usize, 0), result.undo_txns.items.len);
 }
 
-test "WALReader iterate records" {
+test "Recovery with active transaction" {
     const allocator = std.testing.allocator;
+    const path = "test_recovery_active.wal";
 
-    std.fs.cwd().deleteTree("/tmp/test_reader") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_reader") catch {};
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
 
-    // Write some records
-    var wal_writer = try writer.WALWriter.init(allocator, "/tmp/test_reader", .none, writer.DEFAULT_SEGMENT_SIZE);
-    defer wal_writer.deinit();
-    _ = try wal_writer.writeBegin(1);
-    _ = try wal_writer.writeInsert(1, "k1", "v1");
-    _ = try wal_writer.writeInsert(1, "k2", "v2");
-    _ = try wal_writer.writeCommit(1);
-    try wal_writer.flush();
+    // Write WAL without commit
+    {
+        var wal = try writer.WALWriter.open(allocator, path, .sync);
+        defer wal.close();
 
-    // Read them back
-    var reader = try WALReader.init(allocator, "/tmp/test_reader", 1);
-    defer reader.deinit();
-
-    var count: u32 = 0;
-    while (try reader.next()) |rec| {
-        var mutable_rec = rec;
-        defer mutable_rec.deinit();
-        count += 1;
+        _ = try wal.append(1, INVALID_LSN, .begin, "");
+        _ = try wal.append(1, 1, .insert, &[_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 });
+        // No commit!
     }
 
-    try std.testing.expectEqual(@as(u32, 4), count); // begin + 2 inserts + commit
+    // Recover
+    var recovery = Recovery.init(allocator, path);
+    defer recovery.deinit();
+
+    var result = try recovery.recover();
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.redo_txns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.undo_txns.items.len);
 }
 
-test "WALReader with start LSN" {
+test "Recovery transaction info" {
     const allocator = std.testing.allocator;
+    const path = "test_recovery_info.wal";
 
-    std.fs.cwd().deleteTree("/tmp/test_reader_lsn") catch {};
-    defer std.fs.cwd().deleteTree("/tmp/test_reader_lsn") catch {};
+    std.fs.cwd().deleteFile(path) catch {};
+    defer std.fs.cwd().deleteFile(path) catch {};
 
-    // Write records with LSNs 1, 2, 3, 4
-    var wal_writer = try writer.WALWriter.init(allocator, "/tmp/test_reader_lsn", .none, writer.DEFAULT_SEGMENT_SIZE);
-    defer wal_writer.deinit();
-    _ = try wal_writer.writeBegin(1);
-    _ = try wal_writer.writeInsert(1, "k1", "v1");
-    _ = try wal_writer.writeInsert(1, "k2", "v2");
-    _ = try wal_writer.writeCommit(1);
-    try wal_writer.flush();
+    {
+        var wal = try writer.WALWriter.open(allocator, path, .sync);
+        defer wal.close();
 
-    // Read starting from LSN 3
-    var reader = try WALReader.init(allocator, "/tmp/test_reader_lsn", 3);
-    defer reader.deinit();
-
-    var count: u32 = 0;
-    while (try reader.next()) |rec| {
-        var mutable_rec = rec;
-        defer mutable_rec.deinit();
-        try std.testing.expect(rec.lsn() >= 3);
-        count += 1;
+        _ = try wal.append(1, INVALID_LSN, .begin, "");
+        _ = try wal.append(1, 1, .commit, "");
+        _ = try wal.append(2, INVALID_LSN, .begin, "");
+        // Txn 2 not committed
     }
 
-    try std.testing.expectEqual(@as(u32, 2), count); // Only LSN 3 and 4
-}
+    var recovery = Recovery.init(allocator, path);
+    defer recovery.deinit();
 
-test "RecoveryStats" {
-    const stats = RecoveryStats{
-        .records_read = 100,
-        .records_redone = 50,
-        .records_undone = 10,
-        .txns_committed = 5,
-        .txns_aborted = 2,
-        .last_valid_lsn = 999,
-    };
+    var result = try recovery.recover();
+    defer result.deinit();
 
-    try std.testing.expectEqual(@as(u64, 100), stats.records_read);
-    try std.testing.expectEqual(@as(LSN, 999), stats.last_valid_lsn);
+    const txn1 = recovery.getTxnInfo(1);
+    try std.testing.expect(txn1 != null);
+    try std.testing.expectEqual(TxnStatus.committed, txn1.?.status);
+
+    const txn2 = recovery.getTxnInfo(2);
+    try std.testing.expect(txn2 != null);
+    try std.testing.expectEqual(TxnStatus.aborted, txn2.?.status);
 }

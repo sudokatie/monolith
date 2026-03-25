@@ -1,241 +1,238 @@
 const std = @import("std");
-const monolith = @import("monolith");
-const DB = monolith.DB;
-const DBConfig = monolith.DBConfig;
+const db_mod = @import("db.zig");
+const types = @import("core/types.zig");
 
-const BENCH_DIR = "/tmp/monolith_bench";
+const Database = db_mod.Database;
+const Config = types.Config;
 
-// Simple print function for Zig 0.15
-fn print(comptime fmt: []const u8, args: anytype) void {
-    var buf: [4096]u8 = undefined;
-    const str = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.posix.write(1, str) catch {};
-}
+/// Benchmark configuration
+pub const BenchConfig = struct {
+    /// Number of operations
+    num_ops: usize = 10000,
+    /// Key size in bytes
+    key_size: usize = 16,
+    /// Value size in bytes
+    value_size: usize = 100,
+    /// Read/write ratio (0.0 = all writes, 1.0 = all reads)
+    read_ratio: f64 = 0.5,
+    /// Database page size
+    page_size: usize = types.DEFAULT_PAGE_SIZE,
+    /// Buffer pool size
+    cache_size: usize = 16 * 1024 * 1024, // 16MB
+};
 
-fn cleanup() void {
-    std.fs.cwd().deleteTree(BENCH_DIR) catch {};
-}
+/// Benchmark results
+pub const BenchResult = struct {
+    /// Total operations
+    ops: usize,
+    /// Elapsed time in nanoseconds
+    elapsed_ns: u64,
+    /// Operations per second
+    ops_per_sec: f64,
+    /// Average latency in microseconds
+    avg_latency_us: f64,
+    /// Throughput in MB/s
+    throughput_mb_s: f64,
+};
 
-fn formatDuration(ns: u64) [32]u8 {
-    var buf: [32]u8 = undefined;
-    @memset(&buf, 0);
-    if (ns < 1000) {
-        _ = std.fmt.bufPrint(&buf, "{d}ns", .{ns}) catch {};
-    } else if (ns < 1_000_000) {
-        _ = std.fmt.bufPrint(&buf, "{d:.2}us", .{@as(f64, @floatFromInt(ns)) / 1000.0}) catch {};
-    } else if (ns < 1_000_000_000) {
-        _ = std.fmt.bufPrint(&buf, "{d:.2}ms", .{@as(f64, @floatFromInt(ns)) / 1_000_000.0}) catch {};
-    } else {
-        _ = std.fmt.bufPrint(&buf, "{d:.2}s", .{@as(f64, @floatFromInt(ns)) / 1_000_000_000.0}) catch {};
+/// Run insert benchmark
+pub fn benchInsert(allocator: std.mem.Allocator, config: BenchConfig) !BenchResult {
+    const path = "bench_insert.db";
+    std.fs.cwd().deleteFile(path) catch {};
+    std.fs.cwd().deleteFile("bench_insert.db.wal") catch {};
+    defer {
+        std.fs.cwd().deleteFile(path) catch {};
+        std.fs.cwd().deleteFile("bench_insert.db.wal") catch {};
     }
-    return buf;
+
+    const db = try Database.open(allocator, path, .{
+        .page_size = config.page_size,
+        .cache_size = config.cache_size,
+        .sync_mode = .none, // No sync for benchmarks
+    });
+    defer db.close();
+
+    const key_buf = try allocator.alloc(u8, config.key_size);
+    defer allocator.free(key_buf);
+    const value_buf = try allocator.alloc(u8, config.value_size);
+    defer allocator.free(value_buf);
+
+    // Fill value with random data
+    var prng = std.Random.DefaultPrng.init(12345);
+    prng.fill(value_buf);
+
+    const start = std.time.nanoTimestamp();
+
+    for (0..config.num_ops) |i| {
+        // Generate key
+        _ = std.fmt.bufPrint(key_buf, "{d:0>16}", .{i}) catch continue;
+        try db.put(key_buf, value_buf);
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns: u64 = @intCast(end - start);
+
+    const data_size = config.num_ops * (config.key_size + config.value_size);
+    const elapsed_sec = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+
+    return .{
+        .ops = config.num_ops,
+        .elapsed_ns = elapsed_ns,
+        .ops_per_sec = @as(f64, @floatFromInt(config.num_ops)) / elapsed_sec,
+        .avg_latency_us = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(config.num_ops)) / 1000.0,
+        .throughput_mb_s = @as(f64, @floatFromInt(data_size)) / elapsed_sec / 1_000_000.0,
+    };
 }
 
-fn formatOpsPerSec(ops: u64, ns: u64) [32]u8 {
-    var buf: [32]u8 = undefined;
-    @memset(&buf, 0);
-    if (ns == 0) {
-        _ = std.fmt.bufPrint(&buf, "inf ops/sec", .{}) catch {};
-    } else {
-        const ops_per_sec = @as(f64, @floatFromInt(ops)) * 1_000_000_000.0 / @as(f64, @floatFromInt(ns));
-        if (ops_per_sec >= 1_000_000) {
-            _ = std.fmt.bufPrint(&buf, "{d:.2}M ops/sec", .{ops_per_sec / 1_000_000.0}) catch {};
-        } else if (ops_per_sec >= 1_000) {
-            _ = std.fmt.bufPrint(&buf, "{d:.2}K ops/sec", .{ops_per_sec / 1_000.0}) catch {};
+/// Run read benchmark
+pub fn benchRead(allocator: std.mem.Allocator, config: BenchConfig) !BenchResult {
+    const path = "bench_read.db";
+    std.fs.cwd().deleteFile(path) catch {};
+    std.fs.cwd().deleteFile("bench_read.db.wal") catch {};
+    defer {
+        std.fs.cwd().deleteFile(path) catch {};
+        std.fs.cwd().deleteFile("bench_read.db.wal") catch {};
+    }
+
+    const db = try Database.open(allocator, path, .{
+        .page_size = config.page_size,
+        .cache_size = config.cache_size,
+        .sync_mode = .none,
+    });
+    defer db.close();
+
+    const key_buf = try allocator.alloc(u8, config.key_size);
+    defer allocator.free(key_buf);
+    const value_buf = try allocator.alloc(u8, config.value_size);
+    defer allocator.free(value_buf);
+
+    // Populate database first
+    for (0..config.num_ops) |i| {
+        _ = std.fmt.bufPrint(key_buf, "{d:0>16}", .{i}) catch continue;
+        try db.put(key_buf, value_buf);
+    }
+
+    const start = std.time.nanoTimestamp();
+
+    for (0..config.num_ops) |i| {
+        _ = std.fmt.bufPrint(key_buf, "{d:0>16}", .{i}) catch continue;
+        if (try db.get(key_buf)) |val| {
+            allocator.free(val);
+        }
+    }
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns: u64 = @intCast(end - start);
+
+    const data_size = config.num_ops * (config.key_size + config.value_size);
+    const elapsed_sec = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+
+    return .{
+        .ops = config.num_ops,
+        .elapsed_ns = elapsed_ns,
+        .ops_per_sec = @as(f64, @floatFromInt(config.num_ops)) / elapsed_sec,
+        .avg_latency_us = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(config.num_ops)) / 1000.0,
+        .throughput_mb_s = @as(f64, @floatFromInt(data_size)) / elapsed_sec / 1_000_000.0,
+    };
+}
+
+/// Run mixed workload benchmark
+pub fn benchMixed(allocator: std.mem.Allocator, config: BenchConfig) !BenchResult {
+    const path = "bench_mixed.db";
+    std.fs.cwd().deleteFile(path) catch {};
+    std.fs.cwd().deleteFile("bench_mixed.db.wal") catch {};
+    defer {
+        std.fs.cwd().deleteFile(path) catch {};
+        std.fs.cwd().deleteFile("bench_mixed.db.wal") catch {};
+    }
+
+    const db = try Database.open(allocator, path, .{
+        .page_size = config.page_size,
+        .cache_size = config.cache_size,
+        .sync_mode = .none,
+    });
+    defer db.close();
+
+    const key_buf = try allocator.alloc(u8, config.key_size);
+    defer allocator.free(key_buf);
+    const value_buf = try allocator.alloc(u8, config.value_size);
+    defer allocator.free(value_buf);
+
+    var prng = std.Random.DefaultPrng.init(12345);
+
+    // Pre-populate half the keys
+    for (0..config.num_ops / 2) |i| {
+        _ = std.fmt.bufPrint(key_buf, "{d:0>16}", .{i}) catch continue;
+        try db.put(key_buf, value_buf);
+    }
+
+    const start = std.time.nanoTimestamp();
+
+    var reads: usize = 0;
+    var writes: usize = 0;
+
+    for (0..config.num_ops) |_| {
+        const key_idx = prng.random().uintLessThan(usize, config.num_ops);
+        _ = std.fmt.bufPrint(key_buf, "{d:0>16}", .{key_idx}) catch continue;
+
+        if (prng.random().float(f64) < config.read_ratio) {
+            // Read
+            if (try db.get(key_buf)) |val| {
+                allocator.free(val);
+            }
+            reads += 1;
         } else {
-            _ = std.fmt.bufPrint(&buf, "{d:.0} ops/sec", .{ops_per_sec}) catch {};
+            // Write
+            try db.put(key_buf, value_buf);
+            writes += 1;
         }
     }
-    return buf;
+
+    const end = std.time.nanoTimestamp();
+    const elapsed_ns: u64 = @intCast(end - start);
+
+    const data_size = config.num_ops * (config.key_size + config.value_size);
+    const elapsed_sec = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+
+    return .{
+        .ops = config.num_ops,
+        .elapsed_ns = elapsed_ns,
+        .ops_per_sec = @as(f64, @floatFromInt(config.num_ops)) / elapsed_sec,
+        .avg_latency_us = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(config.num_ops)) / 1000.0,
+        .throughput_mb_s = @as(f64, @floatFromInt(data_size)) / elapsed_sec / 1_000_000.0,
+    };
 }
 
-fn printResult(name: []const u8, ops: u64, ns: u64) void {
-    const duration = formatDuration(ns / ops);
-    const throughput = formatOpsPerSec(ops, ns);
-    
-    print("{s:<30} {d:>10} ops  {s:>12}  {s:>16}\n", .{
-        name,
-        ops,
-        std.mem.sliceTo(&duration, 0),
-        std.mem.sliceTo(&throughput, 0),
-    });
+/// Print benchmark results
+pub fn printResult(name: []const u8, result: BenchResult) void {
+    std.debug.print("\n{s}:\n", .{name});
+    std.debug.print("  Operations:    {d}\n", .{result.ops});
+    std.debug.print("  Time:          {d:.2} ms\n", .{@as(f64, @floatFromInt(result.elapsed_ns)) / 1_000_000.0});
+    std.debug.print("  Ops/sec:       {d:.0}\n", .{result.ops_per_sec});
+    std.debug.print("  Avg latency:   {d:.2} us\n", .{result.avg_latency_us});
+    std.debug.print("  Throughput:    {d:.2} MB/s\n", .{result.throughput_mb_s});
 }
 
-fn benchSequentialWrites(allocator: std.mem.Allocator, config: DBConfig, count: u64) !u64 {
-    cleanup();
-    defer cleanup();
+/// Run all benchmarks
+pub fn runAll(allocator: std.mem.Allocator) !void {
+    std.debug.print("=== Monolith Benchmarks ===\n", .{});
 
-    const db = try DB.open(allocator, BENCH_DIR, config);
-    defer db.close();
+    const config = BenchConfig{
+        .num_ops = 10000,
+        .key_size = 16,
+        .value_size = 100,
+    };
 
-    var key_buf: [32]u8 = undefined;
-    const value = "benchmark_value_data_012345678901234567890123456789";
+    const insert_result = try benchInsert(allocator, config);
+    printResult("Sequential Insert", insert_result);
 
-    var timer = try std.time.Timer.start();
+    const read_result = try benchRead(allocator, config);
+    printResult("Sequential Read", read_result);
 
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        const key = std.fmt.bufPrint(&key_buf, "key_{d:0>16}", .{i}) catch unreachable;
-        try db.put(key, value);
-    }
+    const mixed_result = try benchMixed(allocator, config);
+    printResult("Mixed Workload (50/50)", mixed_result);
 
-    return timer.read();
-}
-
-fn benchSequentialReads(allocator: std.mem.Allocator, config: DBConfig, count: u64) !u64 {
-    cleanup();
-    defer cleanup();
-
-    const db = try DB.open(allocator, BENCH_DIR, config);
-    defer db.close();
-
-    // Populate first
-    var key_buf: [32]u8 = undefined;
-    const value = "benchmark_value_data_012345678901234567890123456789";
-
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        const key = std.fmt.bufPrint(&key_buf, "key_{d:0>16}", .{i}) catch unreachable;
-        try db.put(key, value);
-    }
-
-    // Now benchmark reads
-    var timer = try std.time.Timer.start();
-
-    i = 0;
-    while (i < count) : (i += 1) {
-        const key = std.fmt.bufPrint(&key_buf, "key_{d:0>16}", .{i}) catch unreachable;
-        _ = try db.get(key);
-    }
-
-    return timer.read();
-}
-
-fn benchRandomReads(allocator: std.mem.Allocator, config: DBConfig, count: u64) !u64 {
-    cleanup();
-    defer cleanup();
-
-    const db = try DB.open(allocator, BENCH_DIR, config);
-    defer db.close();
-
-    // Populate first
-    var key_buf: [32]u8 = undefined;
-    const value = "benchmark_value_data_012345678901234567890123456789";
-
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        const key = std.fmt.bufPrint(&key_buf, "key_{d:0>16}", .{i}) catch unreachable;
-        try db.put(key, value);
-    }
-
-    // Now benchmark random reads
-    var rng = std.Random.DefaultPrng.init(42);
-    var timer = try std.time.Timer.start();
-
-    i = 0;
-    while (i < count) : (i += 1) {
-        const idx = rng.random().intRangeAtMost(u64, 0, count - 1);
-        const key = std.fmt.bufPrint(&key_buf, "key_{d:0>16}", .{idx}) catch unreachable;
-        _ = try db.get(key);
-    }
-
-    return timer.read();
-}
-
-fn benchTransactions(allocator: std.mem.Allocator, config: DBConfig, count: u64) !u64 {
-    cleanup();
-    defer cleanup();
-
-    const db = try DB.open(allocator, BENCH_DIR, config);
-    defer db.close();
-
-    var key_buf: [32]u8 = undefined;
-    const value = "txn_value";
-
-    var timer = try std.time.Timer.start();
-
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        var txn = try db.begin();
-
-        // Do 10 operations per transaction
-        var j: u64 = 0;
-        while (j < 10) : (j += 1) {
-            const key = std.fmt.bufPrint(&key_buf, "txn_key_{d:0>8}_{d}", .{ i, j }) catch unreachable;
-            try txn.put(key, value);
-        }
-
-        try txn.commit();
-        txn.deinit();
-    }
-
-    return timer.read();
-}
-
-fn benchRangeScan(allocator: std.mem.Allocator, config: DBConfig, count: u64) !u64 {
-    cleanup();
-    defer cleanup();
-
-    const db = try DB.open(allocator, BENCH_DIR, config);
-    defer db.close();
-
-    // Populate
-    var key_buf: [32]u8 = undefined;
-    const value = "range_value";
-
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        const key = std.fmt.bufPrint(&key_buf, "rng_{d:0>16}", .{i}) catch unreachable;
-        try db.put(key, value);
-    }
-
-    // Benchmark full scan
-    var timer = try std.time.Timer.start();
-
-    var iter = try db.range(null, null);
-    defer iter.close();
-
-    var scanned: u64 = 0;
-    while (true) {
-        const entry = iter.next() catch break;
-        if (entry == null) break;
-        iter.freeEntry(entry.?);
-        scanned += 1;
-    }
-
-    const elapsed = timer.read();
-
-    if (scanned != count) {
-        
-        print("  WARNING: scanned {d} but expected {d}\n", .{ scanned, count });
-    }
-
-    return elapsed;
-}
-
-fn benchBatchedWrites(allocator: std.mem.Allocator, count: u64) !u64 {
-    cleanup();
-    defer cleanup();
-
-    // Use batch sync mode for higher throughput
-    const db = try DB.open(allocator, BENCH_DIR, .{
-        .sync_mode = .none, // No fsync for max speed
-        .enable_wal = false,
-    });
-    defer db.close();
-
-    var key_buf: [32]u8 = undefined;
-    const value = "batch_value_data_0123456789";
-
-    var timer = try std.time.Timer.start();
-
-    var i: u64 = 0;
-    while (i < count) : (i += 1) {
-        const key = std.fmt.bufPrint(&key_buf, "bat_{d:0>16}", .{i}) catch unreachable;
-        try db.put(key, value);
-    }
-
-    return timer.read();
+    std.debug.print("\n=== Done ===\n", .{});
 }
 
 pub fn main() !void {
@@ -243,57 +240,47 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    
+    try runAll(allocator);
+}
 
-    print("\n", .{});
-    print("Monolith Benchmarks\n", .{});
-    print("===================\n\n", .{});
+// Tests
 
-    const small_count: u64 = 10_000;
-    const large_count: u64 = 100_000;
+test "bench insert small" {
+    const allocator = std.testing.allocator;
 
-    // Default config (sync mode, WAL enabled)
-    const sync_config = DBConfig{
-        .sync_mode = .sync,
-        .enable_wal = true,
-    };
+    const result = try benchInsert(allocator, .{
+        .num_ops = 100,
+        .key_size = 8,
+        .value_size = 32,
+    });
 
-    // No-sync config for comparison
-    const nosync_config = DBConfig{
-        .sync_mode = .none,
-        .enable_wal = false,
-    };
+    try std.testing.expectEqual(@as(usize, 100), result.ops);
+    try std.testing.expect(result.ops_per_sec > 0);
+}
 
-    print("{s:<30} {s:>10}  {s:>12}  {s:>16}\n", .{ "Benchmark", "Ops", "Latency", "Throughput" });
-    print("{s}\n", .{"-" ** 72});
+test "bench read small" {
+    const allocator = std.testing.allocator;
 
-    // Sequential writes (sync)
-    var ns = try benchSequentialWrites(allocator, sync_config, small_count);
-    printResult("seq write (sync)", small_count, ns);
+    const result = try benchRead(allocator, .{
+        .num_ops = 100,
+        .key_size = 8,
+        .value_size = 32,
+    });
 
-    // Sequential writes (no sync)
-    ns = try benchSequentialWrites(allocator, nosync_config, large_count);
-    printResult("seq write (no sync)", large_count, ns);
+    try std.testing.expectEqual(@as(usize, 100), result.ops);
+    try std.testing.expect(result.ops_per_sec > 0);
+}
 
-    // Batched writes
-    ns = try benchBatchedWrites(allocator, large_count);
-    printResult("batched write", large_count, ns);
+test "bench mixed small" {
+    const allocator = std.testing.allocator;
 
-    // Sequential reads
-    ns = try benchSequentialReads(allocator, nosync_config, large_count);
-    printResult("seq read", large_count, ns);
+    const result = try benchMixed(allocator, .{
+        .num_ops = 100,
+        .key_size = 8,
+        .value_size = 32,
+        .read_ratio = 0.8,
+    });
 
-    // Random reads
-    ns = try benchRandomReads(allocator, nosync_config, large_count);
-    printResult("random read", large_count, ns);
-
-    // Transactions
-    ns = try benchTransactions(allocator, nosync_config, small_count);
-    printResult("transactions (10 ops each)", small_count, ns);
-
-    // Range scan
-    ns = try benchRangeScan(allocator, nosync_config, large_count);
-    printResult("range scan", large_count, ns);
-
-    print("\n", .{});
+    try std.testing.expectEqual(@as(usize, 100), result.ops);
+    try std.testing.expect(result.ops_per_sec > 0);
 }
