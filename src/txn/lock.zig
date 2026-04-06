@@ -159,6 +159,8 @@ pub const LockManager = struct {
     page_locks: std.AutoHashMap(PageId, LockEntry),
     /// Key locks: key hash -> lock entry
     key_locks: std.AutoHashMap(u64, LockEntry),
+    /// Wait-for graph for deadlock detection
+    wait_graph: WaitForGraph,
     /// Default timeout in nanoseconds
     default_timeout_ns: u64,
     /// Statistics
@@ -166,17 +168,20 @@ pub const LockManager = struct {
     locks_released: u64,
     lock_waits: u64,
     lock_timeouts: u64,
+    deadlocks_detected: u64,
 
     pub fn init(allocator: std.mem.Allocator) LockManager {
         return .{
             .allocator = allocator,
             .page_locks = std.AutoHashMap(PageId, LockEntry).init(allocator),
             .key_locks = std.AutoHashMap(u64, LockEntry).init(allocator),
+            .wait_graph = WaitForGraph.init(allocator),
             .default_timeout_ns = 5 * std.time.ns_per_s, // 5 seconds
             .locks_acquired = 0,
             .locks_released = 0,
             .lock_waits = 0,
             .lock_timeouts = 0,
+            .deadlocks_detected = 0,
         };
     }
 
@@ -192,6 +197,8 @@ pub const LockManager = struct {
             entry.value_ptr.deinit();
         }
         self.key_locks.deinit();
+
+        self.wait_graph.deinit();
     }
 
     /// Set default timeout
@@ -419,7 +426,44 @@ pub const LockManager = struct {
             .timeouts = self.lock_timeouts,
             .page_locks = self.page_locks.count(),
             .key_locks = self.key_locks.count(),
+            .deadlocks_detected = self.deadlocks_detected,
         };
+    }
+
+    /// Check for deadlock before waiting for a lock.
+    /// Adds edges to wait-for graph and checks for cycles.
+    pub fn checkDeadlock(
+        self: *LockManager,
+        entry: *const LockEntry,
+        waiter_txn: TransactionId,
+    ) DeadlockError!void {
+        // For each holder, check if waiting would create a cycle
+        for (entry.holders.items) |holder| {
+            if (holder.txn_id == waiter_txn) continue; // Skip self
+
+            if (self.wait_graph.wouldCauseCycle(waiter_txn, holder.txn_id)) {
+                self.deadlocks_detected += 1;
+                return DeadlockError.DeadlockDetected;
+            }
+        }
+    }
+
+    /// Record that a transaction is waiting for lock holders.
+    pub fn recordWaiting(
+        self: *LockManager,
+        entry: *const LockEntry,
+        waiter_txn: TransactionId,
+    ) !void {
+        for (entry.holders.items) |holder| {
+            if (holder.txn_id != waiter_txn) {
+                try self.wait_graph.addEdge(waiter_txn, holder.txn_id);
+            }
+        }
+    }
+
+    /// Clear waiting state when transaction gets lock or aborts.
+    pub fn clearWaiting(self: *LockManager, txn_id: TransactionId) void {
+        self.wait_graph.removeEdgesFrom(txn_id);
     }
 
     /// Check if transaction holds a lock
@@ -448,6 +492,165 @@ pub const LockStats = struct {
     timeouts: u64,
     page_locks: usize,
     key_locks: usize,
+    deadlocks_detected: u64,
+};
+
+/// Wait-for graph for deadlock detection.
+/// Tracks which transactions are waiting for which other transactions.
+pub const WaitForGraph = struct {
+    allocator: std.mem.Allocator,
+    /// Edges: txn_id -> list of txn_ids it's waiting for
+    edges: std.AutoHashMap(TransactionId, std.ArrayList(TransactionId)),
+    /// Statistics
+    deadlocks_detected: u64,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return .{
+            .allocator = allocator,
+            .edges = std.AutoHashMap(TransactionId, std.ArrayList(TransactionId)).init(allocator),
+            .deadlocks_detected = 0,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var it = self.edges.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.edges.deinit();
+    }
+
+    /// Add an edge: waiter is waiting for holder
+    pub fn addEdge(self: *Self, waiter: TransactionId, holder: TransactionId) !void {
+        const result = try self.edges.getOrPut(waiter);
+        if (!result.found_existing) {
+            result.value_ptr.* = .{};
+        }
+
+        // Check if edge already exists
+        for (result.value_ptr.items) |h| {
+            if (h == holder) return;
+        }
+
+        try result.value_ptr.append(self.allocator, holder);
+    }
+
+    /// Remove all edges from a transaction (when it stops waiting or commits)
+    pub fn removeEdgesFrom(self: *Self, txn_id: TransactionId) void {
+        if (self.edges.getPtr(txn_id)) |list| {
+            list.clearAndFree(self.allocator);
+        }
+    }
+
+    /// Remove a specific edge
+    pub fn removeEdge(self: *Self, waiter: TransactionId, holder: TransactionId) void {
+        if (self.edges.getPtr(waiter)) |list| {
+            for (list.items, 0..) |h, i| {
+                if (h == holder) {
+                    _ = list.orderedRemove(i);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Check if adding an edge would create a cycle (deadlock).
+    /// Returns true if a cycle would be created.
+    pub fn wouldCauseCycle(self: *Self, waiter: TransactionId, holder: TransactionId) bool {
+        // If waiter == holder, that's a self-loop (shouldn't happen but check)
+        if (waiter == holder) return true;
+
+        // Use DFS to check if holder can reach waiter (would form a cycle)
+        var visited = std.AutoHashMap(TransactionId, void).init(self.allocator);
+        defer visited.deinit();
+
+        return self.dfsReaches(&visited, holder, waiter);
+    }
+
+    /// DFS: check if 'from' can reach 'target'
+    fn dfsReaches(
+        self: *Self,
+        visited: *std.AutoHashMap(TransactionId, void),
+        from: TransactionId,
+        target: TransactionId,
+    ) bool {
+        if (from == target) return true;
+
+        // Already visited?
+        if (visited.contains(from)) return false;
+        visited.put(from, {}) catch return false;
+
+        // Check all neighbors
+        if (self.edges.get(from)) |neighbors| {
+            for (neighbors.items) |neighbor| {
+                if (self.dfsReaches(visited, neighbor, target)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// Detect any cycle in the graph (for debugging/monitoring).
+    /// Returns a transaction ID involved in a cycle, or null if no cycle.
+    pub fn detectCycle(self: *Self) ?TransactionId {
+        var visited = std.AutoHashMap(TransactionId, void).init(self.allocator);
+        defer visited.deinit();
+
+        var in_stack = std.AutoHashMap(TransactionId, void).init(self.allocator);
+        defer in_stack.deinit();
+
+        var it = self.edges.keyIterator();
+        while (it.next()) |txn_id| {
+            if (!visited.contains(txn_id.*)) {
+                if (self.dfsCycleDetect(&visited, &in_stack, txn_id.*)) |cycle_txn| {
+                    return cycle_txn;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// DFS cycle detection helper
+    fn dfsCycleDetect(
+        self: *Self,
+        visited: *std.AutoHashMap(TransactionId, void),
+        in_stack: *std.AutoHashMap(TransactionId, void),
+        txn_id: TransactionId,
+    ) ?TransactionId {
+        visited.put(txn_id, {}) catch return null;
+        in_stack.put(txn_id, {}) catch return null;
+
+        if (self.edges.get(txn_id)) |neighbors| {
+            for (neighbors.items) |neighbor| {
+                if (!visited.contains(neighbor)) {
+                    if (self.dfsCycleDetect(visited, in_stack, neighbor)) |cycle| {
+                        return cycle;
+                    }
+                } else if (in_stack.contains(neighbor)) {
+                    self.deadlocks_detected += 1;
+                    return neighbor; // Found a cycle
+                }
+            }
+        }
+
+        _ = in_stack.remove(txn_id);
+        return null;
+    }
+
+    /// Get statistics
+    pub fn getDeadlocksDetected(self: *const Self) u64 {
+        return self.deadlocks_detected;
+    }
+};
+
+/// Deadlock error
+pub const DeadlockError = error{
+    DeadlockDetected,
 };
 
 // Tests
@@ -580,8 +783,146 @@ test "LockStats" {
         .timeouts = 2,
         .page_locks = 50,
         .key_locks = 30,
+        .deadlocks_detected = 5,
     };
 
     try std.testing.expectEqual(@as(u64, 100), stats.acquired);
     try std.testing.expectEqual(@as(usize, 50), stats.page_locks);
+    try std.testing.expectEqual(@as(u64, 5), stats.deadlocks_detected);
+}
+
+test "WaitForGraph init" {
+    const allocator = std.testing.allocator;
+    var graph = WaitForGraph.init(allocator);
+    defer graph.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), graph.getDeadlocksDetected());
+}
+
+test "WaitForGraph add and remove edges" {
+    const allocator = std.testing.allocator;
+    var graph = WaitForGraph.init(allocator);
+    defer graph.deinit();
+
+    // T1 waits for T2
+    try graph.addEdge(1, 2);
+
+    // T1 waits for T3
+    try graph.addEdge(1, 3);
+
+    // Check edges exist (indirectly via cycle detection)
+    // T2 -> T1 would form a cycle since T1 -> T2 exists
+    try std.testing.expect(graph.wouldCauseCycle(2, 1));
+
+    // Remove edges from T1
+    graph.removeEdgesFrom(1);
+
+    // Now T2 -> T1 should NOT form a cycle
+    try std.testing.expect(!graph.wouldCauseCycle(2, 1));
+}
+
+test "WaitForGraph cycle detection simple" {
+    const allocator = std.testing.allocator;
+    var graph = WaitForGraph.init(allocator);
+    defer graph.deinit();
+
+    // T1 -> T2 (T1 waits for T2)
+    try graph.addEdge(1, 2);
+
+    // T2 -> T1 would form a cycle
+    try std.testing.expect(graph.wouldCauseCycle(2, 1));
+
+    // T3 -> T1 would NOT form a cycle
+    try std.testing.expect(!graph.wouldCauseCycle(3, 1));
+}
+
+test "WaitForGraph cycle detection chain" {
+    const allocator = std.testing.allocator;
+    var graph = WaitForGraph.init(allocator);
+    defer graph.deinit();
+
+    // T1 -> T2 -> T3
+    try graph.addEdge(1, 2);
+    try graph.addEdge(2, 3);
+
+    // T3 -> T1 would complete a cycle
+    try std.testing.expect(graph.wouldCauseCycle(3, 1));
+
+    // T4 -> T2 would NOT form a cycle
+    try std.testing.expect(!graph.wouldCauseCycle(4, 2));
+}
+
+test "WaitForGraph detectCycle" {
+    const allocator = std.testing.allocator;
+    var graph = WaitForGraph.init(allocator);
+    defer graph.deinit();
+
+    // No cycle initially
+    try graph.addEdge(1, 2);
+    try graph.addEdge(2, 3);
+    try std.testing.expect(graph.detectCycle() == null);
+
+    // Add cycle: T3 -> T1
+    try graph.addEdge(3, 1);
+    try std.testing.expect(graph.detectCycle() != null);
+}
+
+test "LockManager deadlock detection" {
+    const allocator = std.testing.allocator;
+
+    var manager = LockManager.init(allocator);
+    defer manager.deinit();
+
+    // T1 holds lock on page 1
+    const s1 = try manager.lockPage(1, 100, .exclusive);
+    try std.testing.expectEqual(LockStatus.granted, s1);
+
+    // T2 holds lock on page 2
+    const s2 = try manager.lockPage(2, 101, .exclusive);
+    try std.testing.expectEqual(LockStatus.granted, s2);
+
+    // T1 tries to get page 2 (would wait for T2)
+    const w1 = try manager.lockPage(2, 100, .exclusive);
+    try std.testing.expectEqual(LockStatus.waiting, w1);
+
+    // Record T1 waiting for T2
+    if (manager.page_locks.getPtr(2)) |entry| {
+        try manager.recordWaiting(entry, 100);
+    }
+
+    // T2 trying to get page 1 would deadlock (T2 -> T1, but T1 -> T2 exists)
+    if (manager.page_locks.getPtr(1)) |entry| {
+        try std.testing.expectError(
+            DeadlockError.DeadlockDetected,
+            manager.checkDeadlock(entry, 101),
+        );
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), manager.deadlocks_detected);
+}
+
+test "LockManager clearWaiting" {
+    const allocator = std.testing.allocator;
+
+    var manager = LockManager.init(allocator);
+    defer manager.deinit();
+
+    // Setup: T1 waiting for T2
+    _ = try manager.lockPage(1, 101, .exclusive);
+    _ = try manager.lockPage(1, 100, .exclusive); // waiting
+
+    if (manager.page_locks.getPtr(1)) |entry| {
+        try manager.recordWaiting(entry, 100);
+    }
+
+    // Clear T1's waiting state (e.g., after abort)
+    manager.clearWaiting(100);
+
+    // Now T2 waiting for T1 should NOT deadlock
+    if (manager.page_locks.getPtr(1)) |entry| {
+        // This should not error since we cleared T1's edges
+        manager.checkDeadlock(entry, 101) catch {
+            try std.testing.expect(false); // Should not reach here
+        };
+    }
 }
