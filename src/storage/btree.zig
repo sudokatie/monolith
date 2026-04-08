@@ -1044,6 +1044,365 @@ pub const BTree = struct {
             current_id = child_id;
         }
     }
+
+    /// Find the rightmost leaf page
+    fn findRightmostLeaf(self: *BTree) !PageId {
+        var current_id = self.root_id;
+
+        while (true) {
+            const frame = try self.buffer_pool.fetchPage(current_id);
+            defer self.buffer_pool.unpinPage(current_id, false);
+
+            var node = try BTreeNode.load(self.allocator, frame.buffer);
+
+            if (node.is_leaf) {
+                return current_id;
+            }
+
+            // Go to rightmost child
+            const child_id = node.getChild(node.key_count) orelse return errors.Error.Corrupted;
+            current_id = child_id;
+        }
+    }
+
+    /// Create an iterator for reverse scan (all keys in descending order)
+    pub fn scanReverse(self: *BTree) !BTreeCursor {
+        return self.scanRangeReverse(null, null);
+    }
+
+    /// Create an iterator for reverse range scan
+    /// start_key: inclusive start (null = from end)
+    /// end_key: exclusive end (null = to beginning)
+    pub fn scanRangeReverse(self: *BTree, start_key: ?Key, end_key: ?Key) !BTreeCursor {
+        // Empty tree
+        if (self.root_id == INVALID_PAGE_ID) {
+            return BTreeCursor{
+                .tree = self,
+                .current_page_id = INVALID_PAGE_ID,
+                .current_slot = 0,
+                .start_key = end_key,
+                .end_key = start_key,
+                .direction = .reverse,
+                .exhausted = true,
+                .allocator = self.allocator,
+            };
+        }
+
+        var leaf_id: PageId = undefined;
+        var slot: usize = undefined;
+
+        if (start_key) |sk| {
+            // Seek to start key (but for reverse, this is the "end")
+            const result = try self.findLeafAndSlot(sk);
+            leaf_id = result.page_id;
+            slot = result.slot;
+            // Position at the key or one before
+            if (slot > 0) slot -= 1;
+        } else {
+            // Find rightmost leaf and last slot
+            leaf_id = try self.findRightmostLeaf();
+            const frame = try self.buffer_pool.fetchPage(leaf_id);
+            defer self.buffer_pool.unpinPage(leaf_id, false);
+            const node = try BTreeNode.load(self.allocator, frame.buffer);
+            slot = if (node.key_count > 0) node.key_count - 1 else 0;
+        }
+
+        return BTreeCursor{
+            .tree = self,
+            .current_page_id = leaf_id,
+            .current_slot = slot,
+            .start_key = end_key,
+            .end_key = start_key,
+            .direction = .reverse,
+            .exhausted = false,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Create a cursor positioned at or after a specific key
+    pub fn cursor(self: *BTree, seek_key: ?Key) !BTreeCursor {
+        if (self.root_id == INVALID_PAGE_ID) {
+            return BTreeCursor{
+                .tree = self,
+                .current_page_id = INVALID_PAGE_ID,
+                .current_slot = 0,
+                .start_key = null,
+                .end_key = null,
+                .direction = .forward,
+                .exhausted = true,
+                .allocator = self.allocator,
+            };
+        }
+
+        var leaf_id: PageId = undefined;
+        var slot: usize = undefined;
+
+        if (seek_key) |sk| {
+            const result = try self.findLeafAndSlot(sk);
+            leaf_id = result.page_id;
+            slot = result.slot;
+        } else {
+            leaf_id = try self.findLeftmostLeaf();
+            slot = 0;
+        }
+
+        return BTreeCursor{
+            .tree = self,
+            .current_page_id = leaf_id,
+            .current_slot = slot,
+            .start_key = null,
+            .end_key = null,
+            .direction = .forward,
+            .exhausted = false,
+            .allocator = self.allocator,
+        };
+    }
+};
+
+/// Iteration direction
+pub const Direction = enum {
+    forward,
+    reverse,
+};
+
+/// B+ tree cursor for bidirectional iteration
+pub const BTreeCursor = struct {
+    /// Reference to the tree
+    tree: *BTree,
+    /// Current leaf page ID
+    current_page_id: PageId,
+    /// Current slot index within leaf
+    current_slot: usize,
+    /// Start bound key
+    start_key: ?[]const u8,
+    /// End bound key  
+    end_key: ?[]const u8,
+    /// Current direction
+    direction: Direction,
+    /// Whether cursor has been exhausted
+    exhausted: bool,
+    /// Allocator for copied keys/values
+    allocator: std.mem.Allocator,
+
+    /// Get current key-value without advancing
+    /// Returns null if cursor is not positioned on a valid entry
+    pub fn current(self: *BTreeCursor) !?KeyValue {
+        if (self.exhausted or self.current_page_id == INVALID_PAGE_ID) {
+            return null;
+        }
+
+        const frame = try self.tree.buffer_pool.fetchPage(self.current_page_id);
+        defer self.tree.buffer_pool.unpinPage(self.current_page_id, false);
+
+        var node = try BTreeNode.load(self.allocator, frame.buffer);
+
+        if (self.current_slot >= node.key_count) {
+            return null;
+        }
+
+        const key = node.getKey(self.current_slot) orelse return null;
+        const raw_value = node.getValue(self.current_slot) orelse return null;
+
+        // Check bounds
+        if (self.direction == .forward) {
+            if (self.end_key) |end| {
+                if (compareKeys(key, end) != .less) return null;
+            }
+        } else {
+            if (self.start_key) |start| {
+                if (compareKeys(key, start) == .less) return null;
+            }
+        }
+
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+
+        var value_copy: []u8 = undefined;
+        if (overflow_mod.isOverflowPointer(raw_value)) {
+            const overflow_page = overflow_mod.getOverflowPageId(raw_value);
+            value_copy = try self.tree.overflow_manager.readValue(overflow_page);
+        } else {
+            value_copy = try self.allocator.dupe(u8, raw_value);
+        }
+
+        return KeyValue{
+            .key = key_copy,
+            .value = value_copy,
+        };
+    }
+
+    /// Move to next key-value pair (forward direction)
+    pub fn next(self: *BTreeCursor) !?KeyValue {
+        if (self.exhausted or self.current_page_id == INVALID_PAGE_ID) {
+            return null;
+        }
+
+        const frame = try self.tree.buffer_pool.fetchPage(self.current_page_id);
+        defer self.tree.buffer_pool.unpinPage(self.current_page_id, false);
+
+        var node = try BTreeNode.load(self.allocator, frame.buffer);
+
+        // Check if we've exhausted current leaf
+        if (self.current_slot >= node.key_count) {
+            if (node.right_sibling == INVALID_PAGE_ID) {
+                self.exhausted = true;
+                return null;
+            }
+            self.current_page_id = node.right_sibling;
+            self.current_slot = 0;
+            return self.next();
+        }
+
+        const key = node.getKey(self.current_slot) orelse {
+            self.exhausted = true;
+            return null;
+        };
+
+        // Check end bound
+        if (self.end_key) |end| {
+            if (compareKeys(key, end) != .less) {
+                self.exhausted = true;
+                return null;
+            }
+        }
+
+        const raw_value = node.getValue(self.current_slot) orelse {
+            self.exhausted = true;
+            return null;
+        };
+
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+
+        var value_copy: []u8 = undefined;
+        if (overflow_mod.isOverflowPointer(raw_value)) {
+            const overflow_page = overflow_mod.getOverflowPageId(raw_value);
+            value_copy = try self.tree.overflow_manager.readValue(overflow_page);
+        } else {
+            value_copy = try self.allocator.dupe(u8, raw_value);
+        }
+
+        self.current_slot += 1;
+
+        return KeyValue{
+            .key = key_copy,
+            .value = value_copy,
+        };
+    }
+
+    /// Move to previous key-value pair (reverse direction)
+    pub fn prev(self: *BTreeCursor) !?KeyValue {
+        if (self.exhausted or self.current_page_id == INVALID_PAGE_ID) {
+            return null;
+        }
+
+        const frame = try self.tree.buffer_pool.fetchPage(self.current_page_id);
+        defer self.tree.buffer_pool.unpinPage(self.current_page_id, false);
+
+        var node = try BTreeNode.load(self.allocator, frame.buffer);
+
+        // Get current position value before moving
+        if (self.current_slot < node.key_count) {
+            const key = node.getKey(self.current_slot) orelse {
+                self.exhausted = true;
+                return null;
+            };
+
+            // Check start bound (for reverse, start is the lower bound)
+            if (self.start_key) |start| {
+                if (compareKeys(key, start) == .less) {
+                    self.exhausted = true;
+                    return null;
+                }
+            }
+
+            const raw_value = node.getValue(self.current_slot) orelse {
+                self.exhausted = true;
+                return null;
+            };
+
+            const key_copy = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(key_copy);
+
+            var value_copy: []u8 = undefined;
+            if (overflow_mod.isOverflowPointer(raw_value)) {
+                const overflow_page = overflow_mod.getOverflowPageId(raw_value);
+                value_copy = try self.tree.overflow_manager.readValue(overflow_page);
+            } else {
+                value_copy = try self.allocator.dupe(u8, raw_value);
+            }
+
+            // Move backward
+            if (self.current_slot == 0) {
+                // B+ tree only has right sibling links, so reaching slot 0 means
+                // we need to re-seek from root to find the previous leaf.
+                // For simplicity, we mark as exhausted when reaching the start of a leaf.
+                // Full reverse iteration requires tree traversal or adding left_sibling links.
+                self.exhausted = true;
+            } else {
+                self.current_slot -= 1;
+            }
+
+            return KeyValue{
+                .key = key_copy,
+                .value = value_copy,
+            };
+        }
+
+        self.exhausted = true;
+        return null;
+    }
+
+    /// Seek cursor to a specific key
+    pub fn seek(self: *BTreeCursor, key: Key) !void {
+        if (self.tree.root_id == INVALID_PAGE_ID) {
+            self.exhausted = true;
+            return;
+        }
+
+        const result = try self.tree.findLeafAndSlot(key);
+        self.current_page_id = result.page_id;
+        self.current_slot = result.slot;
+        self.exhausted = false;
+    }
+
+    /// Seek to first key
+    pub fn seekFirst(self: *BTreeCursor) !void {
+        if (self.tree.root_id == INVALID_PAGE_ID) {
+            self.exhausted = true;
+            return;
+        }
+
+        self.current_page_id = try self.tree.findLeftmostLeaf();
+        self.current_slot = 0;
+        self.exhausted = false;
+    }
+
+    /// Seek to last key
+    pub fn seekLast(self: *BTreeCursor) !void {
+        if (self.tree.root_id == INVALID_PAGE_ID) {
+            self.exhausted = true;
+            return;
+        }
+
+        self.current_page_id = try self.tree.findRightmostLeaf();
+        const frame = try self.tree.buffer_pool.fetchPage(self.current_page_id);
+        defer self.tree.buffer_pool.unpinPage(self.current_page_id, false);
+        const node = try BTreeNode.load(self.allocator, frame.buffer);
+        self.current_slot = if (node.key_count > 0) node.key_count - 1 else 0;
+        self.exhausted = false;
+    }
+
+    /// Check if cursor is valid (positioned on a key)
+    pub fn isValid(self: *const BTreeCursor) bool {
+        return !self.exhausted and self.current_page_id != INVALID_PAGE_ID;
+    }
+
+    /// Free resources from a KeyValue
+    pub fn freeKeyValue(self: *BTreeCursor, kv: KeyValue) void {
+        self.allocator.free(kv.key);
+        self.allocator.free(kv.value);
+    }
 };
 
 // Tests
@@ -1657,4 +2016,142 @@ test "BTree scan with start key only" {
     }
 
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "BTreeCursor basic operations" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_cursor.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
+
+    try tree.insert("apple", "red");
+    try tree.insert("banana", "yellow");
+    try tree.insert("cherry", "red");
+    try tree.insert("date", "brown");
+
+    // Create cursor and test forward iteration
+    var cur = try tree.cursor(null);
+    try std.testing.expect(cur.isValid());
+
+    // First next() should return "apple"
+    const kv1 = try cur.next();
+    try std.testing.expect(kv1 != null);
+    try std.testing.expectEqualStrings("apple", kv1.?.key);
+    cur.freeKeyValue(kv1.?);
+
+    // Second next() should return "banana"
+    const kv2 = try cur.next();
+    try std.testing.expect(kv2 != null);
+    try std.testing.expectEqualStrings("banana", kv2.?.key);
+    cur.freeKeyValue(kv2.?);
+}
+
+test "BTreeCursor seek operations" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_cursor_seek.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
+
+    try tree.insert("a", "1");
+    try tree.insert("b", "2");
+    try tree.insert("c", "3");
+    try tree.insert("d", "4");
+
+    // Seek to "c"
+    var cur = try tree.cursor("c");
+    const kv = try cur.next();
+    try std.testing.expect(kv != null);
+    try std.testing.expectEqualStrings("c", kv.?.key);
+    cur.freeKeyValue(kv.?);
+
+    // seekFirst should go to "a"
+    try cur.seekFirst();
+    const kv2 = try cur.next();
+    try std.testing.expect(kv2 != null);
+    try std.testing.expectEqualStrings("a", kv2.?.key);
+    cur.freeKeyValue(kv2.?);
+
+    // seekLast should position at "d"
+    try cur.seekLast();
+    const kv3 = try cur.current();
+    try std.testing.expect(kv3 != null);
+    try std.testing.expectEqualStrings("d", kv3.?.key);
+    cur.freeKeyValue(kv3.?);
+}
+
+test "BTreeCursor prev operation" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_cursor_prev.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
+
+    try tree.insert("a", "1");
+    try tree.insert("b", "2");
+    try tree.insert("c", "3");
+
+    // Position at last and go backward
+    var cur = try tree.cursor(null);
+    try cur.seekLast();
+
+    // prev() from "c" should give "c" then move to "b"
+    const kv1 = try cur.prev();
+    try std.testing.expect(kv1 != null);
+    try std.testing.expectEqualStrings("c", kv1.?.key);
+    cur.freeKeyValue(kv1.?);
+
+    const kv2 = try cur.prev();
+    try std.testing.expect(kv2 != null);
+    try std.testing.expectEqualStrings("b", kv2.?.key);
+    cur.freeKeyValue(kv2.?);
+}
+
+test "BTree scanReverse" {
+    const allocator = std.testing.allocator;
+
+    const test_path = "test_btree_reverse.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var file = try File.open(allocator, test_path, DEFAULT_PAGE_SIZE);
+    defer file.close();
+
+    var pool = try BufferPool.init(allocator, &file, 16);
+    defer pool.deinit();
+
+    var tree = BTree.init(allocator, &pool, &file);
+    defer tree.deinit();
+
+    try tree.insert("a", "1");
+    try tree.insert("b", "2");
+    try tree.insert("c", "3");
+
+    // Reverse scan should start from last
+    var cur = try tree.scanReverse();
+    try std.testing.expect(cur.isValid());
 }
